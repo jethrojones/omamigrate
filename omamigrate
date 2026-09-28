@@ -1983,6 +1983,13 @@ def make_gui_handler(page_html):
                         cmd += ["--select", ",".join(sel)]
                     elif b.get("carbon"):
                         cmd.append("--all")
+                    for e in (b.get("extra") or []):
+                        if e:
+                            cmd += ["--extra", e]
+                    if b.get("protect"):
+                        cmd += ["--protect", b["protect"]]
+                    if b.get("passphrase"):
+                        cmd += ["--passphrase", b["passphrase"]]
                     proc = spawn_stream(cmd)
                     self._sse(stream_proc(proc))
                 elif path == "/api/serve":
@@ -2033,13 +2040,17 @@ def make_gui_handler(page_html):
                         cmd += ["--select", ",".join(b["select"])]
                     if b.get("exclude"):
                         cmd += ["--exclude", ",".join(b["exclude"])]
+                    if b.get("passphrase"):
+                        cmd += ["--passphrase", b["passphrase"]]
                     proc = spawn_stream(cmd)
                     self._sse(stream_proc(proc))
                 elif path == "/api/verify":
                     b = self._body()
-                    r = subprocess.run(
-                        [sys.executable, os.path.abspath(__file__), "verify",
-                         b.get("bundle", "")], capture_output=True, text=True)
+                    vc = [sys.executable, os.path.abspath(__file__), "verify",
+                          b.get("bundle", "")]
+                    if b.get("passphrase"):
+                        vc += ["--passphrase", b["passphrase"]]
+                    r = subprocess.run(vc, capture_output=True, text=True)
                     try:
                         self._json(json.loads(r.stdout))
                     except json.JSONDecodeError:
@@ -2062,6 +2073,7 @@ def make_gui_handler(page_html):
         def _load_gen(self, b):
             url = b.get("url")
             dest_path = b.get("path")
+            passphrase = b.get("passphrase")
             if url:
                 dest = INBOX / Path(urllib.parse.urlparse(url).path.split("/")[-1]
                                     or "bundle.tar.zst")
@@ -2088,11 +2100,14 @@ def make_gui_handler(page_html):
             if not dest_path or not Path(dest_path).exists():
                 yield {"event": "error", "line": "bundle not found"}
                 return
-            yield from self._manifest_gen(dest_path)
+            yield from self._manifest_gen(dest_path, passphrase)
 
-        def _manifest_gen(self, dest_path):
+        def _manifest_gen(self, dest_path, passphrase=None):
             try:
-                m = read_manifest(dest_path)
+                m = read_manifest(dest_path, passphrase)
+            except SystemExit as e:
+                yield {"event": "error", "line": str(e) or "bundle error"}
+                return
             except Exception as e:
                 yield {"event": "error", "line": f"cannot read bundle: {e}"}
                 return
@@ -2426,7 +2441,34 @@ body{
       </label>
     </div>
     <div class="grid" id="cat-grid"></div>
-    <div id="sensitive-warn" class="warn" hidden>🔐 This includes sensitive items (secrets &amp; personal files). Set a password in step 3 to protect the bundle before it leaves this machine.</div>
+    <div id="sensitive-warn" class="warn" hidden>🔐 This includes sensitive items (secrets &amp; personal files). Protect the bundle with the control below before it leaves this machine.</div>
+
+    <!-- extras & protection -->
+    <div class="mt">
+      <div class="rsec">
+        <h5>📎 Extra files &amp; folders</h5>
+        <div class="row" style="margin-top:8px">
+          <input id="extra-input" placeholder="/absolute/path/to/add" style="flex:1;min-width:220px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:9px 12px;font-family:ui-monospace,monospace;font-size:13px">
+          <button class="btn" onclick="addExtra()">add</button>
+        </div>
+        <div class="chips" id="extra-chips"></div>
+      </div>
+      <div class="rsec" style="margin-top:10px">
+        <h5>🔐 Protect the bundle</h5>
+        <div class="row" style="margin-top:8px">
+          <select id="protect" onchange="protectChange()" style="background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:9px 12px;font-size:13.5px">
+            <option value="">none — plain bundle</option>
+            <option value="auto">auto — 1Password if signed in, else age</option>
+            <option value="1password">1Password (via op)</option>
+            <option value="age">age (passphrase)</option>
+          </select>
+          <input id="passphrase" type="password" placeholder="passphrase (age only)" class="hidden" style="flex:1;min-width:200px;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:9px 12px;font-family:ui-monospace,monospace;font-size:13px">
+        </div>
+        <p class="muted" style="font-size:12px;margin-top:8px">If you protect it, the new machine is asked for this passphrase before it can open the bundle. 1Password uses your signed-in <span class="mono">op</span> account — no passphrase needed.</p>
+      </div>
+      <div id="aimodels-hint" class="warn hidden" style="margin-top:10px"></div>
+    </div>
+
     <div class="row mt spread">
       <button class="btn ghost" onclick="go('landing')">← back</button>
       <div class="row">
@@ -2482,6 +2524,9 @@ body{
         <input id="recv-url" placeholder="http://old-machine:PORT/?token=…   or   /path/to/bundle.tar.zst">
         <button class="btn primary" id="load-btn" onclick="doLoad()">Load bundle →</button>
       </div>
+      <div class="recin" style="margin-top:8px">
+        <input id="recv-pw" type="password" placeholder="passphrase, if the bundle is protected (leave blank for plain or 1Password)">
+      </div>
     </div>
 
     <div class="hidden mt" id="recv-progress">
@@ -2521,7 +2566,7 @@ body{
 <script>
 const $=s=>document.querySelector(s);
 const CIRC=2*Math.PI*66;
-let INV=null, BUNDLE=null, SERVING=false, lastCat=new Set(), agentDone=false;
+let INV=null, BUNDLE=null, SERVING=false, lastCat=new Set(), agentDone=false, EXTRAS=[], BUNDLE_PW="";
 $("#ring-bar").style.strokeDasharray=CIRC;
 $("#ring-bar").style.strokeDashoffset=CIRC;
 
@@ -2574,6 +2619,9 @@ async function startSend(){
     INV=await api("/api/scan",{});
   }catch(e){$("#send-sub").textContent="scan failed: "+e;return}
   $("#send-sub").textContent=`${INV.host} · omarchy ${INV.omarchy||"?"} · ${INV.user}`;
+  EXTRAS=[];renderExtras();
+  $("#protect").value="";$("#passphrase").value="";$("#passphrase").classList.add("hidden");
+  aimodelsHint();
   renderCats();
 }
 function renderCats(){
@@ -2623,6 +2671,46 @@ function updateSelSum(){
   const sens=INV.categories.some(c=>c.optin&&lastCat.has(c.id));
   const w=$("#sensitive-warn");
   if(w)w.hidden=!sens;
+  aimodelsHint();
+}
+function addExtra(){
+  const inp=$("#extra-input");const v=inp.value.trim();
+  if(!v){toast("enter a path to add",true);return}
+  if(v[0]!="/"){toast("use an absolute path (starts with /)",true);return}
+  if(!EXTRAS.includes(v))EXTRAS.push(v);
+  inp.value="";renderExtras();
+}
+function removeExtra(i){EXTRAS.splice(i,1);renderExtras()}
+function renderExtras(){
+  const box=$("#extra-chips");box.innerHTML="";
+  EXTRAS.forEach((e,i)=>{
+    const ch=el("span","chip");
+    ch.appendChild(document.createTextNode(e+" "));
+    const x=el("b",null,"✕");x.style.cursor="pointer";x.onclick=()=>removeExtra(i);
+    ch.appendChild(x);box.appendChild(ch);
+  });
+}
+function protectChange(){
+  const m=$("#protect").value;
+  $("#passphrase").classList.toggle("hidden",!m||m==="1password");
+}
+function lanCopy(path){
+  const s=/ /g.test(path)?'"'+path+'"':path;
+  return "rsync -av --progress "+s+" new-machine:"+path;
+}
+function aimodelsHint(){
+  const box=$("#aimodels-hint");
+  const c=INV&&INV.categories.find(x=>x.id==="aimodels");
+  const on=c&&lastCat.has("aimodels")&&c.meta&&c.meta.lan&&c.meta.lan.length;
+  if(!on){box.classList.add("hidden");box.innerHTML="";return}
+  box.classList.remove("hidden");
+  box.innerHTML="🧠 Local AI models are large. Instead of packing them, copy them straight over the LAN from the old machine (replace <span class='mono'>new-machine</span> with the target):";
+  c.meta.lan.forEach(l=>{
+    const d=el("div",null,"");d.style.margin="5px 0";d.style.fontSize="12.5px";
+    d.appendChild(document.createTextNode(human(l.bytes)+" · "+l.files+" files · "));
+    d.appendChild(cmdChip(lanCopy(l.path)));
+    box.appendChild(d);
+  });
 }
 function setRing(pct,sub){
   $("#ring-pct").textContent=Math.round(pct*100)+"%";
@@ -2633,13 +2721,16 @@ async function doPack(){
   const sel=[...lastCat];
   const carbon=sel.length===INV.categories.length;
   if(!sel.length){toast("Pick at least one category",true);return}
+  const prot=$("#protect").value;
+  const pw=$("#passphrase").value;
+  if(prot==="age"&&!pw){toast("age protection needs a passphrase",true);return}
   $("#pack-btn").disabled=true;
   $("#send-progress").classList.remove("hidden");
   $("#send-ready").classList.add("hidden");
   $("#pack-console").innerHTML="";
   let total=0,bytes=0;
   try{
-    await sse("/api/pack",{carbon,select:sel},ev=>{
+    await sse("/api/pack",{carbon,select:sel,extra:EXTRAS,protect:prot,passphrase:pw},ev=>{
       if(ev.event==="count"){total=ev.total;bytes=ev.bytes;setRing(0,"gathering")}
       else if(ev.event==="file"){setRing(ev.done/total,"gathering");$("#pack-tick").textContent=ev.name;$("#pack-size").textContent=human(bytes)}
       else if(ev.event==="phase"){setRing(1,"compressing");$("#pack-tick").textContent="squeezing it tight…"}
@@ -2692,19 +2783,29 @@ function startReceive(){
 async function doLoad(){
   const v=$("#recv-url").value.trim();
   if(!v){toast("paste a link or path",true);return}
+  const pw=$("#recv-pw").value;
+  BUNDLE_PW=pw;
   $("#load-btn").disabled=true;
   $("#recv-input").classList.add("hidden");
   $("#recv-progress").classList.remove("hidden");
   $("#dl-console").innerHTML="";
   const isUrl=/^https?:\/\//i.test(v);
+  const body=isUrl?{url:v}:{path:v};body.passphrase=pw;
   try{
-    await sse("/api/load",isUrl?{url:v}:{path:v},ev=>{
+    await sse("/api/load",body,ev=>{
       if(ev.event==="download"){
         const pct=ev.total?ev.done/ev.total:0;
         $("#dl-pct").textContent=ev.total?Math.round(pct*100)+"%":human(ev.done);
         $("#dl-tick").textContent=human(ev.done)+(ev.total?" / "+human(ev.total):"")+" received";
       }else if(ev.event==="error"){
-        log("#dl-console",ev.line,"err");toast(ev.line,true);
+        log("#dl-console",ev.line,"err");
+        const needsPw=/passphrase|1Password|encrypted|op signin/i.test(ev.line);
+        if(needsPw){
+          // protected bundle, passphrase missing or wrong — go back and ask
+          $("#recv-progress").classList.add("hidden");
+          $("#recv-input").classList.remove("hidden");
+        }
+        toast(ev.line,true);
       }else if(ev.event==="ready"){
         BUNDLE=ev.path;
         renderManifest(ev.manifest);
@@ -2731,6 +2832,8 @@ function renderManifest(m){
     <div class="mrow"><span class="k">files</span><span>${(m.files||[]).length}</span></div>
     <div class="mrow"><span class="k">size</span><span>${human(totBytes)}</span></div>
     <div class="mrow"><span class="k">packages</span><span>${(m.packages||[]).length}</span></div>
+    ${(m.protect)?`<div class="mrow"><span class="k">protected</span><span>🔐 ${m.protect.method}</span></div>`:""}
+    ${(m.extra_paths&&m.extra_paths.length)?`<div class="mrow" style="display:block"><span class="k">extra paths</span><div class="chips">${m.extra_paths.map(e=>`<span class="chip">${e.path} · ${human(e.bytes)}</span>`).join("")}</div></div>`:""}
     <div class="mrow"><span class="k">defaults</span><span class="mono" style="font-size:12.5px">term ${d.terminal||"?"} · ed ${d.editor||"?"} · br ${d.browser||"?"}${d.agent?" · ag "+d.agent:""}</span></div>
     ${(m.themes||[]).length?`<div class="mrow" style="display:block"><span class="k">themes</span><div class="chips">${m.themes.map(t=>`<span class="chip">${t.name}</span>`).join("")}</div></div>`:""}
     ${(m.plugins||[]).length?`<div class="mrow" style="display:block"><span class="k">plugins</span><div class="chips">${m.plugins.map(p=>`<span class="chip">${p.id}</span>`).join("")}</div></div>`:""}
@@ -2762,7 +2865,7 @@ async function doApply(){
   buildSteps();
   let ok=false;
   try{
-    await sse("/api/apply",{bundle:BUNDLE,dry_run:dry},ev=>{
+    await sse("/api/apply",{bundle:BUNDLE,dry_run:dry,passphrase:BUNDLE_PW},ev=>{
       if(ev.event==="step"){
         stepSet(ev.id,ev.status,ev.detail||"");
         if(ev.status==="error")log("#apply-console",ev.label+": "+ev.detail,"err");
@@ -2851,7 +2954,7 @@ function buildReport(rep){
 async function showDone(ev,dry,ok){
   let rep=null;
   if(!dry){
-    try{rep=await api("/api/verify",{bundle:BUNDLE})}catch(e){}
+    try{rep=await api("/api/verify",{bundle:BUNDLE,passphrase:BUNDLE_PW})}catch(e){}
   }
   $("#recv-apply").classList.add("hidden");
   $("#recv-done").classList.remove("hidden");
