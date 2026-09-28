@@ -24,8 +24,10 @@ import argparse
 import hashlib
 import json
 import os
+import pty
 import re
 import secrets
+import select
 import shutil
 import socket
 import subprocess
@@ -544,11 +546,266 @@ def resolve_selection(inv, select=None, exclude=None):
 
 
 # ---------------------------------------------------------------------------
+# bundle protection (1Password / age)
+# ---------------------------------------------------------------------------
+
+OP_POINTER_MAGIC = "op-document"
+
+
+def _last_line(s):
+    s = (s or "").strip()
+    return s.splitlines()[-1] if s else "no output"
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b[=>]")
+
+
+def _first_error_line(s):
+    """The first 'error' line of a CLI transcript, else its last line."""
+    s = _ANSI_RE.sub("", s or "")
+    lines = s.strip().splitlines()
+    for line in lines:
+        if "error" in line.lower():
+            return line.strip()
+    return lines[-1].strip() if lines else "no output"
+
+
+def op_signed_in():
+    """True if the 1Password CLI has a signed-in account to use."""
+    if not has("op"):
+        return False
+    r = run(["op", "account", "list", "--format", "json"])
+    if r.returncode != 0:
+        return False
+    try:
+        accts = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return False
+    return isinstance(accts, list) and len(accts) > 0
+
+
+def protect_usable(method):
+    """None if the protection method can run here, else an error string."""
+    if method == "1password":
+        if not has("op"):
+            return "the 1Password CLI (op) is not installed. Use --protect age."
+        if not op_signed_in():
+            return ("no 1Password account is signed in to the CLI "
+                    "(see: op account list). Sign in, or use --protect age.")
+        return None
+    if method == "age":
+        if not has("age"):
+            return "age is not installed. Install it: sudo pacman -S age"
+        return None
+    return f"unknown protection method: {method}"
+
+
+def age_passphrase(cmd, passphrase):
+    """Run an age command that prompts for a passphrase on a TTY.
+
+    age only reads the passphrase from a terminal, so the child gets a
+    pseudo-terminal and its prompts are answered from it.
+    Returns (returncode, output text with the passphrase masked).
+    """
+    master, slave = pty.openpty()
+    buf = b""
+    try:
+        # start_new_session: age prefers /dev/tty for its passphrase prompt;
+        # in a new session there is no controlling tty, so it falls back to
+        # stdin (our pty), where we can feed the passphrase.
+        proc = subprocess.Popen(cmd, stdin=slave, stdout=slave,
+                                stderr=slave, close_fds=True,
+                                start_new_session=True)
+        os.close(slave)
+        answered = 0
+        deadline = time.time() + 600
+        while True:
+            if time.time() > deadline:
+                proc.kill()
+                text = buf.decode("utf-8", "replace")
+                if passphrase:
+                    text = text.replace(passphrase, "***")
+                return 124, text + "\nage: timed out"
+            try:
+                r, _, _ = select.select([master], [], [], 5)
+            except OSError:
+                break
+            if not r:
+                continue
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            low = buf.lower()
+            prompts = low.count(b"enter passphrase") + \
+                low.count(b"confirm passphrase")
+            while answered < prompts:
+                os.write(master, (passphrase + "\n").encode())
+                answered += 1
+        while True:
+            try:
+                r, _, _ = select.select([master], [], [], 0.2)
+            except OSError:
+                break
+            if not r:
+                break
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+        proc.wait()
+        text = buf.decode("utf-8", "replace")
+        if passphrase:
+            text = text.replace(passphrase, "***")
+        return proc.returncode, text
+    finally:
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+
+def _op_pointer(p):
+    """Parse and validate a .op pointer file. Returns its metadata."""
+    try:
+        meta = json.loads(Path(p).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"{p.name} is not a valid 1Password bundle "
+                         f"pointer: {e}")
+    if not isinstance(meta, dict) or \
+            meta.get("omamigrate") != OP_POINTER_MAGIC or \
+            not meta.get("item_id"):
+        raise SystemExit(f"{p.name} is not an omamigrate 1Password pointer")
+    return meta
+
+
+def resolve_bundle(bundle, passphrase=None):
+    """Decrypt a bundle if needed. The single decrypt entry point.
+
+    Plain bundle  -> (bundle, False); caller owns the path.
+    <name>.age    -> age-decrypted (passphrase arg or OMAMIGRATE_PASSPHRASE)
+    <name>.op     -> downloaded from 1Password with the signed-in op account
+    In both cases returns (temp_path, True); the caller must delete the
+    temp file when done.
+    """
+    p = Path(bundle)
+    if p.suffix == ".age":
+        pw = passphrase or os.environ.get("OMAMIGRATE_PASSPHRASE")
+        if not pw:
+            raise SystemExit(f"{p.name} is age-encrypted. Pass the "
+                             "passphrase with --passphrase or set "
+                             "OMAMIGRATE_PASSPHRASE.")
+        if not has("age"):
+            raise SystemExit("age is not installed; install it to decrypt "
+                             "this bundle: sudo pacman -S age")
+        tmp = Path(tempfile.mkstemp(prefix="omamigrate-decrypt-",
+                                    suffix=".tar.zst")[1])
+        # age -d auto-detects passphrase-protected files and prompts;
+        # the input file must come after all flags
+        rc, out = age_passphrase(
+            ["age", "-d", "-o", str(tmp), str(p)], pw)
+        if rc != 0:
+            tmp.unlink(missing_ok=True)
+            if "no identity" in out or "incorrect passphrase" in out:
+                raise SystemExit(f"Could not decrypt {p.name}: wrong "
+                                 "passphrase (or the file is not "
+                                 "age-encrypted).")
+            raise SystemExit("age decrypt failed: " + _first_error_line(out))
+        return tmp, True
+    if p.suffix == ".op":
+        meta = _op_pointer(p)
+        if not has("op"):
+            raise SystemExit(f"{p.name} is protected with 1Password, but "
+                             "the 1Password CLI (op) is not installed "
+                             "here.")
+        if not op_signed_in():
+            raise SystemExit(f"{p.name} is protected with 1Password. Sign "
+                             "in to the CLI first (op signin), then retry.")
+        tmp = Path(tempfile.mkstemp(prefix="omamigrate-op-",
+                                    suffix=".tar.zst")[1])
+        r = run(["op", "document", "get", meta["item_id"], "-o", str(tmp),
+                 "--force"])
+        if r.returncode != 0:
+            tmp.unlink(missing_ok=True)
+            raise SystemExit("Could not download the 1Password document: "
+                             + _last_line(r.stderr or r.stdout))
+        return tmp, True
+    return p, False
+
+
+def protect_bundle(path, protect, events):
+    """Encrypt a freshly written plaintext bundle, then delete the
+    plaintext. Returns the final path (.age file or .op pointer)."""
+    path = Path(path)
+    method = protect.get("method")
+    err = protect_usable(method)
+    if err:
+        path.unlink(missing_ok=True)
+        raise SystemExit(err)
+    if method == "age":
+        pw = protect.get("passphrase") or os.environ.get("OMAMIGRATE_PASSPHRASE")
+        if not pw:
+            path.unlink(missing_ok=True)
+            raise SystemExit("age protection needs a passphrase "
+                             "(--passphrase or OMAMIGRATE_PASSPHRASE)")
+        emit(events, {"event": "log", "line": "encrypting with age "
+                                             "(passphrase)"})
+        out = path.with_name(path.name + ".age")
+        rc, out_txt = age_passphrase(
+            ["age", "-e", "-p", "-o", str(out), str(path)], pw)
+        if rc != 0:
+            path.unlink(missing_ok=True)
+            out.unlink(missing_ok=True)
+            raise SystemExit("age encrypt failed: " + _first_error_line(out_txt))
+        path.unlink()
+        return out
+    if method == "1password":
+        title = "omamigrate bundle " + datetime.now().strftime("%Y-%m-%d %H:%M")
+        emit(events, {"event": "log",
+                      "line": "encrypting with 1Password (op document create)"})
+        r = run(["op", "document", "create", str(path), "--title", title,
+                 "--file-name", path.name, "--format", "json"])
+        if r.returncode != 0:
+            path.unlink(missing_ok=True)
+            raise SystemExit("op document create failed: "
+                             + _last_line(r.stderr or r.stdout))
+        item_id = None
+        try:
+            item = json.loads(r.stdout)
+            if isinstance(item, dict):
+                item_id = item.get("id")
+        except json.JSONDecodeError:
+            pass
+        if not item_id:
+            path.unlink(missing_ok=True)
+            raise SystemExit("op document create: could not read the "
+                             "document id from: " + r.stdout.strip()[:200])
+        out = path.with_name(path.name + ".op")
+        out.write_text(json.dumps({
+            "omamigrate": OP_POINTER_MAGIC,
+            "method": "1password",
+            "item_id": item_id,
+            "file_name": path.name,
+            "title": title,
+        }, indent=2))
+        path.unlink()
+        return out
+    path.unlink(missing_ok=True)
+    raise SystemExit(f"unknown protection method: {method}")
+
+
+# ---------------------------------------------------------------------------
 # pack
 # ---------------------------------------------------------------------------
 
 def pack_bundle(inv, selection, out, events, mode="selective",
-                include_packages=False):
+                include_packages=False, protect=None):
     emit(events, {"event": "start", "phase": "gather"})
     files = []
     seen = set()
@@ -675,6 +932,8 @@ def pack_bundle(inv, selection, out, events, mode="selective",
                             for m in c["meta"].get("packages", [])}),
         "defaults": defaults_meta,
     }
+    if protect:
+        manifest["protect"] = {"method": protect["method"]}
     manifest["selection"]["categories"] = sorted(
         cid for cid, v in cat_counts.items() if v["files"])
     if include_packages and manifest["packages"]:
@@ -700,6 +959,9 @@ def pack_bundle(inv, selection, out, events, mode="selective",
         with tarfile.open(out, "w:gz") as tf:
             tf.add(root, arcname="omamigrate")
     shutil.rmtree(tmp, ignore_errors=True)
+    if protect:
+        emit(events, {"event": "phase", "phase": "protect"})
+        out = protect_bundle(out, protect, events)
     size = out.stat().st_size
     emit(events, {"event": "done", "path": str(out), "bytes": size,
                   "files": len(manifest["files"])})
@@ -731,8 +993,23 @@ def cmd_pack(args):
         print("Nothing selected. Use --all or --select cat1,cat2 "
               "(see: omamigrate scan)", file=sys.stderr)
         return 1
-    pack_bundle(inv, select, out, args.events, mode=mode,
-                include_packages=want_pkgs or args.all)
+    protect = None
+    if args.protect:
+        method = args.protect
+        if method == "auto":
+            method = "1password" if op_signed_in() else "age"
+        protect = {"method": method, "passphrase": args.passphrase}
+        err = protect_usable(method)
+        if not err and method == "age" and not (
+                args.passphrase or os.environ.get("OMAMIGRATE_PASSPHRASE")):
+            err = ("age protection needs a passphrase "
+                   "(--passphrase or OMAMIGRATE_PASSPHRASE)")
+        if err:
+            print(err, file=sys.stderr)
+            return 1
+    out, _ = pack_bundle(inv, select, out, args.events, mode=mode,
+                         include_packages=want_pkgs or args.all,
+                         protect=protect)
     if not args.events:
         print(f"Bundle ready: {out}")
     return 0
@@ -742,42 +1019,82 @@ def cmd_pack(args):
 # unpack / verify
 # ---------------------------------------------------------------------------
 
-def open_bundle(bundle):
-    return tarfile.open(str(bundle), "r:*")
+class _DecryptedBundle:
+    """A tarfile view over a decrypted temp bundle; removes the temp
+    file when closed."""
+
+    def __init__(self, tf, tmp):
+        self._tf = tf
+        self._tmp = tmp
+
+    def __getattr__(self, name):
+        return getattr(self._tf, name)
+
+    def close(self):
+        self._tf.close()
+        if self._tmp:
+            Path(self._tmp).unlink(missing_ok=True)
+            self._tmp = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
 
-def read_manifest(bundle):
+def open_bundle(bundle, passphrase=None):
+    """Open a bundle for reading. Encrypted bundles (.age/.op) are
+    decrypted to a temp file first; closing the result removes it."""
+    real, temp = resolve_bundle(bundle, passphrase)
+    if not temp:
+        return tarfile.open(str(real), "r:*")
+    return _DecryptedBundle(tarfile.open(str(real), "r:*"), real)
+
+
+def read_manifest(bundle, passphrase=None):
     bundle = Path(bundle)
     if bundle.suffix == ".json":
         return json.loads(bundle.read_text())
+    real, temp = resolve_bundle(bundle, passphrase)
     try:
-        with open_bundle(bundle) as tf:
-            m = tf.extractfile("omamigrate/manifest.json")
-            if not m:
-                raise SystemExit(f"No manifest in {bundle}")
-            return json.loads(m.read())
-    except tarfile.TarError:
-        # older pythons can't read zstd natively; fall back to tar
-        r = run(["tar", "--zstd", "-xf", str(bundle),
-                 "omamigrate/manifest.json", "-C", tempfile.mkdtemp(prefix="omam-")])
-        if r.returncode != 0:
-            raise SystemExit(f"Cannot open bundle: {r.stderr.strip()}")
-        import glob
-        g = glob.glob(tempfile.gettempdir() + "/omam-*/omamigrate/manifest.json")
-        return json.loads(Path(g[0]).read_text()) if g else None
+        try:
+            with open_bundle(str(real)) as tf:
+                m = tf.extractfile("omamigrate/manifest.json")
+                if not m:
+                    raise SystemExit(f"No manifest in {bundle}")
+                return json.loads(m.read())
+        except tarfile.TarError:
+            # older pythons can't read zstd natively; fall back to tar
+            r = run(["tar", "--zstd", "-xf", str(real),
+                     "omamigrate/manifest.json", "-C", tempfile.mkdtemp(prefix="omam-")])
+            if r.returncode != 0:
+                raise SystemExit(f"Cannot open bundle: {r.stderr.strip()}")
+            import glob
+            g = glob.glob(tempfile.gettempdir() + "/omam-*/omamigrate/manifest.json")
+            return json.loads(Path(g[0]).read_text()) if g else None
+    finally:
+        if temp:
+            Path(real).unlink(missing_ok=True)
 
 
-def extract_bundle(bundle, dest):
-    if str(bundle).endswith(".tar.zst"):
-        r = run(["tar", "--zstd", "-xf", str(bundle), "-C", str(dest)])
-        if r.returncode == 0:
-            return
-    with open_bundle(bundle) as tf:
-        tf.extractall(dest)
+def extract_bundle(bundle, dest, passphrase=None):
+    real, temp = resolve_bundle(bundle, passphrase)
+    try:
+        if str(real).endswith(".tar.zst"):
+            r = run(["tar", "--zstd", "-xf", str(real), "-C", str(dest)])
+            if r.returncode == 0:
+                return
+        with open_bundle(str(real)) as tf:
+            tf.extractall(dest)
+    finally:
+        if temp:
+            Path(real).unlink(missing_ok=True)
 
 
 def cmd_unpack(args):
-    m = read_manifest(args.bundle)
+    m = read_manifest(args.bundle, args.passphrase)
     print(json.dumps({
         "app": m.get("app"), "created": m.get("created"),
         "host": m.get("host"), "user": m.get("user"),
@@ -835,8 +1152,8 @@ def _ver_unknown(v):
     return v in (None, "", "?")
 
 
-def verify_bundle(bundle, events=False):
-    m = read_manifest(bundle)
+def verify_bundle(bundle, events=False, passphrase=None):
+    m = read_manifest(bundle, passphrase)
     ok = missing = 0
     missing_items = []
     for f in m.get("files", []):
@@ -894,7 +1211,7 @@ def verify_bundle(bundle, events=False):
 
 
 def cmd_verify(args):
-    return verify_bundle(args.bundle, args.events)
+    return verify_bundle(args.bundle, args.events, args.passphrase)
 
 
 # ---------------------------------------------------------------------------
@@ -925,7 +1242,7 @@ def cmd_apply(args):
 
     emit(events, {"event": "phase", "phase": "open"})
     tmp = Path(tempfile.mkdtemp(prefix="omamigrate-apply-"))
-    extract_bundle(bundle, tmp)
+    extract_bundle(bundle, tmp, args.passphrase)
     root = tmp / "omamigrate"
     manifest = json.loads((root / "manifest.json").read_text())
     emit(events, {"event": "manifest", "manifest": manifest})
@@ -1341,7 +1658,9 @@ def cmd_serve(args):
     manifest_bytes = b"{}"
     try:
         manifest_bytes = json.dumps(read_manifest(bundle)).encode()
-    except Exception:
+    except (Exception, SystemExit):
+        # encrypted bundles can't be read without the passphrase; serve
+        # the file anyway, the receiver decrypts it locally
         pass
     server = ThreadingHTTPServer(("0.0.0.0", port),
                                  make_serve_handler(bundle, token, manifest_bytes))
@@ -2581,6 +2900,13 @@ def main(argv=None):
     p.add_argument("--out", default=None)
     p.add_argument("--all", action="store_true", help="carbon copy (everything)")
     p.add_argument("--select", default=None, help="comma-separated category ids")
+    p.add_argument("--protect", choices=["1password", "age", "auto"],
+                   default=None,
+                   help="protect the bundle: 1Password via op, age with a "
+                        "passphrase, or auto (1Password if signed in, else age)")
+    p.add_argument("--passphrase", default=None,
+                   help="passphrase for --protect age (or set "
+                        "OMAMIGRATE_PASSPHRASE)")
     p.add_argument("--events", action="store_true")
 
     p = sub.add_parser("serve", help="serve the newest bundle over the LAN")
@@ -2590,16 +2916,25 @@ def main(argv=None):
 
     p = sub.add_parser("unpack", help="inspect a bundle")
     p.add_argument("bundle")
+    p.add_argument("--passphrase", default=None,
+                   help="passphrase for age-protected bundles (or set "
+                        "OMAMIGRATE_PASSPHRASE)")
 
     p = sub.add_parser("apply", help="restore a bundle on this machine")
     p.add_argument("bundle")
     p.add_argument("--select", default=None)
     p.add_argument("--exclude", default=None)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--passphrase", default=None,
+                   help="passphrase for age-protected bundles (or set "
+                        "OMAMIGRATE_PASSPHRASE)")
     p.add_argument("--events", action="store_true")
 
     p = sub.add_parser("verify", help="verify a bundle was restored")
     p.add_argument("bundle")
+    p.add_argument("--passphrase", default=None,
+                   help="passphrase for age-protected bundles (or set "
+                        "OMAMIGRATE_PASSPHRASE)")
     p.add_argument("--events", action="store_true")
 
     p = sub.add_parser("agent", help="let your default agent walk you through it")
