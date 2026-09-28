@@ -9,7 +9,7 @@ license=('MIT')
 depends=('python' 'tar' 'zstd' 'git')
 optdepends=('omarchy: agent-guided mode and menu integration')
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/jethrojones/omamigrate/archive/refs/tags/v${pkgver}.tar.gz")
-sha256sums=('dd070c329931dc95048e0c3aa14c5aa096f2ad0f92f24ba4acfa51a80c0da65a')
+sha256sums=('7c568e1e7fffb9530fc51cc43843d7a17eb0a6c69a02145f1c4c54f4d5419415')
 
 package() {
     cd "${pkgname}-${pkgver}"
