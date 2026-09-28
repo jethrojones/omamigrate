@@ -1,0 +1,2419 @@
+#!/usr/bin/env python3
+"""omamigrate - move your Omarchy from one machine to another.
+
+A standalone, deterministic migration app for Omarchy. It inventories
+everything you customized (configs, themes, plugins, packages, defaults),
+packs it into a portable bundle, and restores it on the new machine -
+with automatic backups, package installs, plugin re-clones and a restart.
+
+Usage:
+  omamigrate                 open the dashboard (GUI)
+  omamigrate agent           let your default agent walk you through it
+  omamigrate scan [--json]   inventory this machine
+  omamigrate pack [...]      build a bundle
+  omamigrate serve [...]     serve the latest bundle over the LAN
+  omamigrate unpack <b>      inspect a bundle
+  omamigrate apply <b> [...] restore on this machine
+  omamigrate verify <b>      check what a bundle restored
+
+Everything is a deterministic script. The agent (if you want one) only
+narrates and asks questions.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION = "1.0.0"
+APP = "omamigrate"
+
+HOME = Path(os.environ.get("HOME", "/root")).expanduser()
+CFG = HOME / ".config"
+SHARE = HOME / ".local" / "share"
+OMSTATE = HOME / ".local" / "state" / "omarchy"
+WORK = HOME / ".omamigrate"
+BUNDLE_DIR = WORK / "bundles"
+INBOX = WORK / "inbox"
+
+EXCLUDE_DIRS = {
+    ".git", "node_modules", "__pycache__", ".cache", ".venv", "venv",
+    ".Trash", "dist", "build", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".next", ".nuxt",
+    # regenerable browser / app caches
+    "Cache", "CacheStorage", "Code Cache", "GPUCache",
+    "GrDpSharedImageCache", "DawnGraphiteCache", "DawnWebGPUCache",
+    "ShaderCache", "component_crx_cache",
+}
+MAX_ITEMS = 20000
+
+
+# ---------------------------------------------------------------------------
+# small utils
+# ---------------------------------------------------------------------------
+
+def human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def emit(events, obj):
+    if events:
+        print(json.dumps(obj, default=str), flush=True)
+
+
+def walk_files(base: Path, rel: str):
+    """Yield (relpath, size) for every regular file under base."""
+    out = []
+    if base.is_file():
+        try:
+            out.append((rel, base.stat().st_size))
+        except OSError:
+            pass
+        return out
+    if not base.is_dir():
+        return out
+    for root, dirs, files in os.walk(base):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        for name in files:
+            if name.endswith(".lock"):
+                continue
+            p = Path(root) / name
+            r = str(Path(rel) / p.relative_to(base))
+            try:
+                if p.is_symlink():
+                    continue
+                st = p.stat()
+            except OSError:
+                continue
+            out.append((r, st.st_size))
+    return out
+
+
+def dir_stats(base: Path, rel: str):
+    files = walk_files(base, rel)
+    return len(files), sum(s for _, s in files)
+
+
+def newest(paths):
+    best, bt = None, 0
+    for p in paths:
+        try:
+            m = p.stat().st_mtime
+        except OSError:
+            continue
+        if m > bt:
+            best, bt = p, m
+    return best
+
+
+def omarchy_version():
+    try:
+        out = run(["omarchy", "version"]).stdout.strip()
+        if out:
+            return out
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def omarchy_channel():
+    try:
+        return run(["omarchy", "channel", "current"]).stdout.strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def has(cmd):
+    return shutil.which(cmd) is not None
+
+
+def git_remote(d: Path):
+    try:
+        out = run(["git", "-C", str(d), "remote", "origin"]).stdout.strip()
+        return out or None
+    except FileNotFoundError:
+        return None
+
+
+def read_state_file(p: Path):
+    try:
+        return p.read_text().strip()
+    except OSError:
+        return None
+
+
+def desktop_to_name(d):
+    table = {
+        "Alacritty.desktop": "alacritty", "foot.desktop": "foot",
+        "com.mitchellh.ghostty.desktop": "ghostty", "kitty.desktop": "kitty",
+        "chromium.desktop": "chromium", "google-chrome.desktop": "chrome",
+        "brave-browser.desktop": "brave", "firefox.desktop": "firefox",
+        "microsoft-edge.desktop": "edge",
+    }
+    return table.get(d, d)
+
+
+def name_to_desktop(n):
+    for d, name in {
+        "alacritty": "Alacritty.desktop", "foot": "foot.desktop",
+        "ghostty": "com.mitchellh.ghostty.desktop", "kitty": "kitty.desktop",
+        "chromium": "chromium.desktop", "chrome": "google-chrome.desktop",
+        "brave": "brave-browser.desktop", "firefox": "firefox.desktop",
+        "edge": "microsoft-edge.desktop",
+    }.items():
+        if n == name:
+            return d
+    return f"{n}.desktop"
+
+
+def current_theme():
+    return read_state_file(OMSTATE / "current" / "theme.name")
+
+
+def theme_colors():
+    """Read the active theme's colors.toml so the UI wears the user's theme."""
+    name = current_theme()
+    tdir = None
+    if name:
+        for cand in (CFG / "omarchy" / "themes" / name,
+                     Path("/usr/share/omarchy/themes") / name):
+            if (cand / "colors.toml").exists():
+                tdir = cand
+                break
+    if not tdir:
+        return None
+    try:
+        import tomllib
+        with open(tdir / "colors.toml", "rb") as f:
+            data = tomllib.load(f)
+        return {
+            "background": data.get("background", "#0a0a0f"),
+            "foreground": data.get("foreground", "#e6e6e6"),
+            "accent": data.get("accent", "#0072CE"),
+            "muted": data.get("muted", "#666"),
+            "green": data.get("green", "#79bc6e"),
+            "red": data.get("red", "#e06c75"),
+            "yellow": data.get("yellow", "#e5c07b"),
+            "cyan": data.get("cyan", "#56b6c2"),
+            "magenta": data.get("magenta", "#c678dd"),
+            "lighter_background": data.get("lighter_background", "#1b1c21"),
+        }
+    except Exception:
+        return None
+
+
+def default_agent():
+    v = read_state_file(CFG / "omarchy" / "defaults" / "agent")
+    if v:
+        return v
+    try:
+        out = run(["omarchy-default-agent"]).stdout.strip()
+        return out or None
+    except FileNotFoundError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# inventory
+# ---------------------------------------------------------------------------
+
+def build_inventory():
+    cats = []
+
+    def add(cat, items, optin=False, meta=None):
+        total_b = sum(i["bytes"] for i in items)
+        total_f = sum(i["files"] for i in items)
+        cats.append({
+            "id": cat["id"], "label": cat["label"], "icon": cat["icon"],
+            "desc": cat["desc"], "optin": optin, "items": items,
+            "bytes": total_b, "files": total_f, "meta": meta or {},
+        })
+
+    def file_item(rel):
+        p = HOME / rel
+        try:
+            st = p.stat()
+        except OSError:
+            return None
+        return {"id": rel, "label": rel.split("/")[-1], "rel": rel,
+                "bytes": st.st_size, "files": 1}
+
+    def dir_item(rel, label=None):
+        p = HOME / rel
+        if not p.exists():
+            return None
+        f, b = dir_stats(p, rel)
+        return {"id": rel, "label": label or rel.split("/")[-1], "rel": rel,
+                "bytes": b, "files": f}
+
+    # -- shell -------------------------------------------------------------
+    items = []
+    for rel in (".config/omarchy/shell.json", ".config/omarchy/shell.toml"):
+        it = file_item(rel)
+        if it:
+            items.append(it)
+    for rel in (".config/omarchy/extensions", ".config/omarchy/themed",
+                ".config/omarchy/hooks", ".config/omarchy/branding"):
+        it = dir_item(rel)
+        if it:
+            items.append(it)
+    om_root = CFG / "omarchy"
+    if om_root.is_dir():
+        for f in sorted(om_root.iterdir()):
+            if f.is_file() and f.suffix == ".json" and f.name not in (
+                    "shell.json",):
+                it = file_item(f".config/omarchy/{f.name}")
+                if it:
+                    items.append(it)
+    plugins_root = CFG / "omarchy" / "plugins"
+    plugin_metas = []
+    if plugins_root.is_dir():
+        for d in sorted(plugins_root.iterdir()):
+            if not d.is_dir():
+                continue
+            rel = f".config/omarchy/plugins/{d.name}"
+            f, b = dir_stats(d, rel)
+            remote = git_remote(d)
+            items.append({"id": rel, "label": d.name, "rel": rel,
+                          "bytes": b, "files": f, "kind": "plugin"})
+            plugin_metas.append({"id": d.name, "remote": remote})
+    add({"id": "shell", "label": "Omarchy Shell", "icon": "⚡",
+         "desc": "Bar layout, widgets, plugins, hooks, menu entries"},
+        items, meta={"plugins": plugin_metas})
+
+    # -- hyprland ----------------------------------------------------------
+    items = []
+    hypr = CFG / "hypr"
+    if hypr.is_dir():
+        for f in sorted(hypr.rglob("*")):
+            if any(part in EXCLUDE_DIRS for part in f.parts):
+                continue
+            if f.name.endswith(".lock"):
+                continue
+            if f.is_file():
+                it = file_item(f".config/hypr/{f.relative_to(hypr)}")
+                if it:
+                    items.append(it)
+    it = dir_item(".local/state/omarchy/toggles", "toggles")
+    if it:
+        items.append(it)
+    add({"id": "hyprland", "label": "Hyprland", "icon": "🪟",
+         "desc": "Keybindings, monitors, input, look & feel, animations"},
+        items)
+
+    # -- themes ------------------------------------------------------------
+    items = []
+    theme_metas = []
+    themes_root = CFG / "omarchy" / "themes"
+    if themes_root.is_dir():
+        for d in sorted(themes_root.iterdir()):
+            if not d.is_dir():
+                continue
+            rel = f".config/omarchy/themes/{d.name}"
+            f, b = dir_stats(d, rel)
+            remote = git_remote(d)
+            items.append({"id": rel, "label": d.name, "rel": rel,
+                          "bytes": b, "files": f, "kind": "theme"})
+            theme_metas.append({"name": d.name, "remote": remote})
+    add({"id": "themes", "label": "Themes & Backgrounds", "icon": "🎨",
+         "desc": "Custom themes, git-installed themes, active theme"},
+        items,
+        meta={"current": current_theme(), "themes": theme_metas})
+
+    # -- terminals -----------------------------------------------------------
+    items = []
+    for t in ("foot", "alacritty", "kitty", "ghostty"):
+        it = dir_item(f".config/{t}", t)
+        if it:
+            items.append(it)
+    add({"id": "terminals", "label": "Terminals", "icon": "🖥️",
+         "desc": "Foot, Alacritty, Kitty, Ghostty configurations"}, items)
+
+    # -- dev -----------------------------------------------------------------
+    items = []
+    specs = [
+        (dir_item(".config/nvim", "nvim config"), ),
+        (dir_item(".local/share/nvim", "nvim data"), ),
+        (dir_item(".config/git", "git"), ),
+        (dir_item(".config/lazygit", "lazygit"), ),
+        (file_item(".config/starship.toml"), ),
+        (dir_item(".config/tmux", "tmux"), ),
+        (dir_item(".config/mise", "mise"), ),
+        (file_item(".bashrc"), ),
+        (file_item(".bash_profile"), ),
+        (file_item(".profile"), ),
+        (file_item(".XCompose"), ),
+    ]
+    for (it,) in specs:
+        if it:
+            items.append(it)
+    add({"id": "dev", "label": "Editor & Dev Tools", "icon": "💻",
+         "desc": "Neovim, git, lazygit, starship, tmux, mise, shell"}, items)
+
+    # -- packages ------------------------------------------------------------
+    pkgs = []
+    try:
+        out = run(["pacman", "-Qqe"]).stdout
+        pkgs = [l for l in out.splitlines() if l.strip()]
+    except FileNotFoundError:
+        pass
+    add({"id": "packages", "label": "Packages", "icon": "📦",
+         "desc": "Everything you explicitly installed (pacman -Qqe)"},
+        [], meta={"packages": pkgs, "count": len(pkgs)})
+
+    # -- defaults ------------------------------------------------------------
+    items = []
+    for rel in (".config/xdg-terminals.list", ".config/mimeapps.list"):
+        it = file_item(rel)
+        if it:
+            items.append(it)
+    it = dir_item(".config/omarchy/defaults", "omarchy defaults")
+    if it:
+        items.append(it)
+    it = dir_item(".local/state/omarchy/defaults", "state defaults")
+    if it:
+        items.append(it)
+    terminal = None
+    term_list = read_state_file(CFG / "xdg-terminals.list")
+    if term_list:
+        for line in term_list.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                terminal = desktop_to_name(line)
+                break
+    browser = None
+    mime = read_state_file(CFG / "mimeapps.list")
+    if mime:
+        for line in mime.splitlines():
+            if line.startswith("text/html="):
+                browser = desktop_to_name(line.split("=", 1)[1])
+                break
+    meta = {
+        "terminal": terminal or "foot",
+        "editor": read_state_file(OMSTATE / "defaults" / "editor") or "nvim",
+        "browser": browser or "chromium",
+        "agent": default_agent(),
+    }
+    add({"id": "defaults", "label": "Defaults", "icon": "🎯",
+         "desc": "Default terminal, editor, browser, agent"}, items, meta=meta)
+
+    # -- apps ------------------------------------------------------------------
+    known_cfg = {"omarchy", "hypr", "foot", "alacritty", "kitty", "ghostty",
+                 "nvim", "git", "lazygit", "tmux", "mise", "starship.toml"}
+    items = []
+    if CFG.is_dir():
+        for e in sorted(CFG.iterdir()):
+            if e.name in known_cfg:
+                continue
+            if e.name.startswith(".") and e.name not in (".",):
+                continue
+            it = dir_item(f".config/{e.name}") if e.is_dir() \
+                else file_item(f".config/{e.name}")
+            if it:
+                items.append(it)
+    add({"id": "apps", "label": "Other App Configs", "icon": "🧩",
+         "desc": "Every other config under ~/.config (browsers, TUIs, AI agents…)"},
+        items)
+
+    # -- share -------------------------------------------------------------------
+    known_share = {"nvim", "mise", "Trash", "pki", "keyrings", "caches",
+                   "gvfs-metadata", "Trash-1000"}
+    items = []
+    if SHARE.is_dir():
+        for e in sorted(SHARE.iterdir()):
+            if e.name in known_share or e.name.startswith("."):
+                continue
+            it = dir_item(f".local/share/{e.name}") if e.is_dir() \
+                else file_item(f".local/share/{e.name}")
+            if it:
+                items.append(it)
+    add({"id": "share", "label": "Local Share Data", "icon": "📁",
+         "desc": "Desktop entries, icons, zoxide, app data under ~/.local/share"},
+        items)
+
+    # -- secrets -------------------------------------------------------------------
+    items = []
+    for rel, label in ((".ssh", "SSH keys"), (".gnupg", "GPG keys"),
+                       (".netrc", ".netrc"),
+                       (".local/share/keyrings", "keyrings")):
+        it = dir_item(rel, label) if (HOME / rel).is_dir() \
+            else file_item(rel, )
+        if it:
+            it["label"] = label
+            items.append(it)
+    add({"id": "secrets", "label": "Secrets & Keys", "icon": "🔐",
+         "desc": "SSH, GPG, keyrings — only if you tick this"}, items,
+        optin=True)
+
+    # -- data --------------------------------------------------------------------
+    items = []
+    for d in ("Documents", "Downloads", "Projects", "Work", "Music",
+              "Pictures", "Videos", "Games"):
+        it = dir_item(d, d)
+        if it and it["files"]:
+            items.append(it)
+    add({"id": "data", "label": "Personal Files", "icon": "📚",
+         "desc": "Documents, projects, media — usually not needed on a fresh box"},
+        items, optin=True)
+
+    return {
+        "host": socket.gethostname(),
+        "user": os.environ.get("USER", "user"),
+        "omarchy": omarchy_version(),
+        "channel": omarchy_channel(),
+        "categories": cats,
+    }
+
+
+def carbon_items(inv):
+    ids = []
+    for cat in inv["categories"]:
+        if cat["optin"]:
+            continue
+        for it in cat["items"]:
+            ids.append(it["id"])
+    return ids
+
+
+def category_ids(inv):
+    return {c["id"] for c in inv["categories"]}
+
+
+def expand_categories(inv, cats):
+    """Expand category ids into item ids (bundleable rels)."""
+    wanted = set(cats)
+    return [it["id"] for c in inv["categories"] if c["id"] in wanted
+            for it in c["items"]]
+
+
+def resolve_selection(inv, select=None, exclude=None):
+    """select: item rels (or None). Returns item ids to pack."""
+    exclude = set(exclude or [])
+    if not select:
+        return []
+    wanted = set(select)
+    return sorted({it["id"] for c in inv["categories"] for it in c["items"]
+                   if it["id"] in wanted and it["id"] not in exclude})
+
+
+# ---------------------------------------------------------------------------
+# pack
+# ---------------------------------------------------------------------------
+
+def pack_bundle(inv, selection, out, events, mode="selective",
+                include_packages=False):
+    emit(events, {"event": "start", "phase": "gather"})
+    files = []
+    seen = set()
+    selset = set(selection)
+    for cat in inv["categories"]:
+        for it in cat["items"]:
+            if it["id"] not in selset:
+                continue
+            base = HOME / it["rel"]
+            if base.is_file():
+                files.append((it["rel"], str(base)))
+                seen.add(it["rel"])
+            else:
+                for rel, _size in walk_files(base, it["rel"]):
+                    if rel not in seen:
+                        seen.add(rel)
+                        files.append((rel, str(HOME / rel)))
+    files.sort()
+    total = len(files)
+    emit(events, {"event": "count", "total": total,
+                  "bytes": sum(os.path.getsize(p) for _, p in files
+                               if os.path.exists(p))})
+
+    tmp = Path(tempfile.mkdtemp(prefix="omamigrate-pack-"))
+    root = tmp / "omamigrate"
+    (root / "files").mkdir(parents=True)
+
+    step = max(1, total // 400)
+    for i, (rel, src) in enumerate(files, 1):
+        dest = root / "files" / rel
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest, follow_symlinks=True)
+        except OSError as e:
+            emit(events, {"event": "log", "line": f"skip {rel}: {e}"})
+        if i % step == 0 or i == total:
+            emit(events, {"event": "file", "done": i, "total": total,
+                          "name": rel})
+
+    plugins = []
+    themes = []
+    for cat in inv["categories"]:
+        for m in cat["meta"].get("plugins", []):
+            if f".config/omarchy/plugins/{m['id']}" in selset:
+                plugins.append(m)
+        for m in cat["meta"].get("themes", []):
+            if f".config/omarchy/themes/{m['name']}" in selset:
+                themes.append(m)
+
+    defaults_meta = {}
+    for cat in inv["categories"]:
+        if cat["id"] == "defaults" and any(
+                it["id"] in selset for it in cat["items"]):
+            defaults_meta = cat["meta"]
+
+    # which category does each selected prefix belong to?
+    cat_of_prefix = {}
+    for cat in inv["categories"]:
+        for it in cat["items"]:
+            if it["id"] in selset:
+                cat_of_prefix[it["rel"].rstrip("/")] = cat["id"]
+
+    def cat_for(rel):
+        best = None
+        for prefix, cid in cat_of_prefix.items():
+            if (rel == prefix or rel.startswith(prefix + "/")) and \
+                    (best is None or len(prefix) > len(best[1])):
+                best = (cid, prefix)
+        return best[0] if best else "misc"
+
+    files_manifest = []
+    for r, s in files:
+        try:
+            size = os.path.getsize(s)
+        except OSError:
+            size = 0
+        files_manifest.append({"rel": r, "bytes": size, "cat": cat_for(r)})
+
+    theme_name = current_theme()
+    theme_selected = any(
+        it["id"].startswith(".config/omarchy/themes/") for it in
+        (it for c in inv["categories"] for it in c["items"])
+        if it["id"] in selset)
+    if theme_name and theme_selected:
+        bg_link = OMSTATE / "current" / "background"
+        bg_rel = None
+        try:
+            target = os.readlink(str(bg_link))
+            m = re.search(r"themes/([^/]+)/backgrounds/([^/]+)$", target)
+            if m:
+                bg_rel = f"themes/{m.group(1)}/backgrounds/{m.group(2)}"
+        except OSError:
+            pass
+        defaults_meta = {**defaults_meta, "theme": theme_name,
+                         "background": bg_rel}
+
+    cat_counts = {}
+    for f in files_manifest:
+        c = cat_counts.setdefault(f["cat"], {"label": "Misc", "files": 0,
+                                             "bytes": 0})
+        c["files"] += 1
+        c["bytes"] += f["bytes"]
+    for c in inv["categories"]:
+        if c["id"] not in cat_counts:
+            cat_counts[c["id"]] = {"label": c["label"], "files": 0, "bytes": 0}
+    for cid, c in cat_counts.items():
+        c["label"] = next((x["label"] for x in inv["categories"]
+                           if x["id"] == cid), c["label"])
+
+    manifest = {
+        "app": APP,
+        "format": 1,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "host": inv["host"],
+        "user": inv["user"],
+        "omarchy": {"version": inv["omarchy"], "channel": inv["channel"]},
+        "selection": {"mode": mode, "categories": [], "items": selection},
+        "categories": cat_counts,
+        "files": files_manifest,
+        "plugins": plugins,
+        "themes": themes,
+        "packages": sorted({m for c in inv["categories"]
+                            if c["id"] == "packages"
+                            for m in c["meta"].get("packages", [])}),
+        "defaults": defaults_meta,
+    }
+    manifest["selection"]["categories"] = sorted(
+        cid for cid, v in cat_counts.items() if v["files"])
+    if include_packages and manifest["packages"]:
+        manifest["selection"]["categories"].append("packages")
+        manifest["selection"]["categories"].sort()
+
+    (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    if manifest["packages"]:
+        (root / "packages.txt").write_text("\n".join(manifest["packages"]) + "\n")
+
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    emit(events, {"event": "phase", "phase": "compress"})
+    if has("zstd"):
+        r = run(["tar", "--zstd", "-cf", str(out), "-C", str(tmp), "omamigrate"])
+        if r.returncode != 0:
+            emit(events, {"event": "log", "line": r.stderr.strip()})
+            out = out.with_suffix(".tar.gz")
+            with tarfile.open(out, "w:gz") as tf:
+                tf.add(root, arcname="omamigrate")
+    else:
+        out = out.with_suffix(".tar.gz")
+        with tarfile.open(out, "w:gz") as tf:
+            tf.add(root, arcname="omamigrate")
+    shutil.rmtree(tmp, ignore_errors=True)
+    size = out.stat().st_size
+    emit(events, {"event": "done", "path": str(out), "bytes": size,
+                  "files": len(manifest["files"])})
+    return out, manifest
+
+
+def cmd_pack(args):
+    inv = build_inventory()
+    out = args.out or str(
+        BUNDLE_DIR / f"omamigrate-{inv['host']}-{datetime.now():%Y%m%d-%H%M%S}.tar.zst")
+    mode = "selective"
+    if args.all:
+        select = carbon_items(inv)
+        mode = "carbon"
+    elif args.select:
+        vals = args.select.split(",")
+        if all(v in category_ids(inv) for v in vals):
+            select = expand_categories(inv, vals)
+        else:
+            select = resolve_selection(inv, select=vals)
+        mode = "carbon" if set(vals) == category_ids(inv) else "selective"
+    else:
+        select = []
+    has_pkgs = any(c["id"] == "packages" and c["meta"].get("packages")
+                   for c in inv["categories"])
+    want_pkgs = args.all or (args.select and
+                             "packages" in args.select.split(","))
+    if not select and not want_pkgs and not has_pkgs:
+        print("Nothing selected. Use --all or --select cat1,cat2 "
+              "(see: omamigrate scan)", file=sys.stderr)
+        return 1
+    pack_bundle(inv, select, out, args.events, mode=mode,
+                include_packages=want_pkgs or args.all)
+    if not args.events:
+        print(f"Bundle ready: {out}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# unpack / verify
+# ---------------------------------------------------------------------------
+
+def open_bundle(bundle):
+    return tarfile.open(str(bundle), "r:*")
+
+
+def read_manifest(bundle):
+    bundle = Path(bundle)
+    if bundle.suffix == ".json":
+        return json.loads(bundle.read_text())
+    try:
+        with open_bundle(bundle) as tf:
+            m = tf.extractfile("omamigrate/manifest.json")
+            if not m:
+                raise SystemExit(f"No manifest in {bundle}")
+            return json.loads(m.read())
+    except tarfile.TarError:
+        # older pythons can't read zstd natively; fall back to tar
+        r = run(["tar", "--zstd", "-xf", str(bundle),
+                 "omamigrate/manifest.json", "-C", tempfile.mkdtemp(prefix="omam-")])
+        if r.returncode != 0:
+            raise SystemExit(f"Cannot open bundle: {r.stderr.strip()}")
+        import glob
+        g = glob.glob(tempfile.gettempdir() + "/omam-*/omamigrate/manifest.json")
+        return json.loads(Path(g[0]).read_text()) if g else None
+
+
+def extract_bundle(bundle, dest):
+    if str(bundle).endswith(".tar.zst"):
+        r = run(["tar", "--zstd", "-xf", str(bundle), "-C", str(dest)])
+        if r.returncode == 0:
+            return
+    with open_bundle(bundle) as tf:
+        tf.extractall(dest)
+
+
+def cmd_unpack(args):
+    m = read_manifest(args.bundle)
+    print(json.dumps({
+        "app": m.get("app"), "created": m.get("created"),
+        "host": m.get("host"), "user": m.get("user"),
+        "omarchy": m.get("omarchy"), "selection": m.get("selection"),
+        "categories": m.get("categories"),
+        "files": len(m.get("files", [])),
+        "packages": len(m.get("packages", [])),
+        "plugins": [p["id"] for p in m.get("plugins", [])],
+        "themes": [t["name"] for t in m.get("themes", [])],
+        "defaults": m.get("defaults"),
+    }, indent=2))
+    return 0
+
+
+def verify_bundle(bundle, events=False):
+    m = read_manifest(bundle)
+    ok = missing = 0
+    missing_rels = []
+    for f in m.get("files", []):
+        p = HOME / f["rel"]
+        if p.exists() and p.stat().st_size == f["bytes"]:
+            ok += 1
+        else:
+            missing += 1
+            if len(missing_rels) < 50:
+                missing_rels.append(f["rel"])
+    pkgs = m.get("packages", [])
+    installed = set()
+    try:
+        installed = set(run(["pacman", "-Qq"]).stdout.split())
+    except FileNotFoundError:
+        pass
+    pkgs_missing = [p for p in pkgs if p not in installed]
+    report = {
+        "files_ok": ok, "files_missing": missing,
+        "files_missing_sample": missing_rels,
+        "packages_total": len(pkgs),
+        "packages_missing": pkgs_missing,
+        "ok": missing == 0 and not pkgs_missing,
+    }
+    if events:
+        emit(events, {"event": "done", **report})
+    else:
+        print(json.dumps(report, indent=2))
+    return 0 if report["ok"] else 2
+
+
+def cmd_verify(args):
+    return verify_bundle(args.bundle, args.events)
+
+
+# ---------------------------------------------------------------------------
+# apply
+# ---------------------------------------------------------------------------
+
+def apply_step(events, step_id, label, fn):
+    emit(events, {"event": "step", "id": step_id, "label": label,
+                  "status": "start"})
+    try:
+        detail = fn() or ""
+        emit(events, {"event": "step", "id": step_id, "status": "done",
+                      "detail": detail})
+        return True
+    except Exception as e:
+        emit(events, {"event": "step", "id": step_id, "status": "error",
+                      "detail": str(e)})
+        return False
+
+
+def cmd_apply(args):
+    events = args.events
+    bundle = Path(args.bundle)
+    if not bundle.exists():
+        print(f"No such bundle: {bundle}", file=sys.stderr)
+        return 1
+    dry = args.dry_run
+
+    emit(events, {"event": "phase", "phase": "open"})
+    tmp = Path(tempfile.mkdtemp(prefix="omamigrate-apply-"))
+    extract_bundle(bundle, tmp)
+    root = tmp / "omamigrate"
+    manifest = json.loads((root / "manifest.json").read_text())
+    emit(events, {"event": "manifest", "manifest": manifest})
+
+    # selection: category ids, item rels, or the bundle's own selection
+    bundle_cats = set(manifest.get("categories", {}).keys())
+    exclude = set(args.exclude.split(",")) if args.exclude else set()
+    if args.select:
+        vals = args.select.split(",")
+        if all(v in bundle_cats for v in vals):
+            sel_cats = set(vals)
+            sel_rels = [f["rel"] for f in manifest.get("files", [])
+                        if f.get("cat") in sel_cats]
+        else:
+            sel_rels = vals
+            sel_cats = {f.get("cat") for f in manifest.get("files", [])
+                        if f["rel"] in set(vals)}
+    else:
+        sel_rels = list(manifest.get("selection", {}).get("items", []))
+        sel_cats = set(manifest.get("selection", {}).get("categories", []))
+    sel_rels = [r for r in sel_rels if r not in exclude]
+    selset = set(sel_rels)
+
+    stats = {"files": 0, "backed_up": 0, "packages": 0,
+             "plugins": 0, "themes": 0, "skipped": []}
+    backup_dir = WORK / "backups" / datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    def step_backup():
+        if dry:
+            return "dry run"
+        n = 0
+        for rel in sel_rels:
+            p = HOME / rel
+            if p.is_file() and p.exists():
+                dest = backup_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(p), str(dest))
+                n += 1
+            elif p.is_dir() and p.exists():
+                for f in walk_files(p, rel):
+                    fp = HOME / f[0]
+                    dest = backup_dir / f[0]
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(fp), str(dest))
+                    n += 1
+        stats["backed_up"] = n
+        return f"{n} files backed up to {backup_dir}" if n else "nothing to back up"
+
+    def step_files():
+        count = 0
+        step_size = max(1, len(sel_rels) // 300)
+        for i, rel in enumerate(sel_rels, 1):
+            src = root / "files" / rel
+            dest = HOME / rel
+            if not src.exists():
+                continue
+            if dry:
+                count += 1
+                if i % step_size == 0:
+                    emit(events, {"event": "file", "done": i, "total": len(sel_rels),
+                                  "name": rel})
+                continue
+            if src.is_file():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dest), follow_symlinks=True)
+            else:
+                for f in walk_files(src, ""):
+                    fp = src / f[0]
+                    dp = dest / f[0]
+                    dp.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(fp), str(dp))
+            count += 1
+            if i % step_size == 0 or i == len(sel_rels):
+                emit(events, {"event": "file", "done": i, "total": len(sel_rels),
+                              "name": rel})
+        stats["files"] = count
+        return f"{count} items restored"
+
+    def log(cmd_out):
+        for line in cmd_out.splitlines():
+            line = line.strip()
+            if line:
+                emit(events, {"event": "log", "line": line})
+
+    def step_packages():
+        pkgs = manifest.get("packages", [])
+        if not pkgs:
+            return "none in bundle"
+        if "packages" not in sel_cats:
+            return "not selected"
+        if dry:
+            stats["packages"] = len(pkgs)
+            return f"would install {len(pkgs)} packages (dry run)"
+        try:
+            installed = set(run(["pacman", "-Qq"]).stdout.split())
+        except FileNotFoundError:
+            installed = set()
+        missing = [p for p in pkgs if p not in installed]
+        if not missing:
+            return "all packages already installed"
+        avail = set()
+        if has("pacman") and missing:
+            r = run(["pacman", "-Si", "--"] + missing)
+            for line in r.stdout.splitlines():
+                if line.startswith("Package "):
+                    avail.add(line.split(":", 1)[1].strip())
+        installable = [p for p in missing if p in avail]
+        notfound = [p for p in missing if p not in avail]
+        for chunk in [installable[i:i + 25]
+                      for i in range(0, len(installable), 25)]:
+            if not chunk:
+                continue
+            cmd = ["omarchy", "pkg", "add"] + chunk if has("omarchy") \
+                else ["pacman", "-S", "--noconfirm", "--needed"] + chunk
+            r = run(cmd)
+            log(r.stdout)
+            if r.returncode != 0:
+                log(f"warn: {' '.join(cmd)} failed: {r.stderr.strip()}")
+        for p in notfound:
+            stats["skipped"].append(f"pkg {p} (not in repos)")
+            emit(events, {"event": "log",
+                          "line": f"skip {p}: not in repos (AUR or renamed?)"})
+        stats["packages"] = len(installable)
+        detail = f"{len(installable)} installed"
+        if notfound:
+            detail += f", {len(notfound)} skipped"
+        return detail
+
+    def overlay(base_dir, rels):
+        n = 0
+        for rel in rels:
+            src = root / "files" / rel
+            if not src.exists():
+                continue
+            if src.is_file():
+                dest = base_dir / rel[len(HOME.as_posix().rstrip('/') + '/'):] \
+                    if rel.startswith(HOME.as_posix()) else base_dir / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dest), follow_symlinks=True)
+            else:
+                for f in walk_files(src, ""):
+                    fp = src / f[0]
+                    dp = base_dir / f[0]
+                    dp.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(fp), str(dp))
+            n += 1
+        return n
+
+    def step_plugins():
+        plugins = manifest.get("plugins", [])
+        if not plugins:
+            return "none"
+        n = 0
+        for p in plugins:
+            dest = CFG / "omarchy" / "plugins" / p["id"]
+            rels = [f["rel"] for f in manifest["files"]
+                    if f["rel"].startswith(f".config/omarchy/plugins/{p['id']}")]
+            if dry:
+                n += 1
+                continue
+            if not rels:
+                continue
+            if p.get("remote"):
+                if not dest.exists():
+                    r = run(["git", "clone", "--", p["remote"], str(dest)])
+                    log(r.stdout.splitlines()[-1] if r.stdout else f"clone {p['id']}")
+                    if r.returncode != 0:
+                        emit(events, {"event": "log",
+                                      "line": f"warn: clone {p['id']} failed: {r.stderr.strip()}"})
+            if not dest.exists():
+                dest.mkdir(parents=True, exist_ok=True)
+            n += overlay(dest, [r.split(f".config/omarchy/plugins/{p['id']}/", 1)[-1]
+                                for r in rels])
+        stats["plugins"] = n
+        return f"{n} plugin files synced"
+
+    def step_themes():
+        themes = manifest.get("themes", [])
+        if not themes:
+            return "none"
+        n = 0
+        for t in themes:
+            dest = CFG / "omarchy" / "themes" / t["name"]
+            rels = [f["rel"] for f in manifest["files"]
+                    if f["rel"].startswith(f".config/omarchy/themes/{t['name']}")]
+            if dry:
+                n += 1
+                continue
+            if not rels:
+                continue
+            if t.get("remote"):
+                if not dest.exists():
+                    r = run(["git", "clone", "--", t["remote"], str(dest)])
+                    if r.returncode != 0:
+                        emit(events, {"event": "log",
+                                      "line": f"warn: clone {t['name']} failed: {r.stderr.strip()}"})
+            if not dest.exists():
+                dest.mkdir(parents=True, exist_ok=True)
+            n += overlay(dest, [r.split(f".config/omarchy/themes/{t['name']}/", 1)[-1]
+                                for r in rels])
+        stats["themes"] = n
+        return f"{n} theme files synced"
+
+    def step_defaults():
+        d = manifest.get("defaults", {})
+        if not d or ("defaults" not in sel_cats and "themes" not in sel_cats):
+            return "not selected"
+        done = []
+        if dry:
+            done = [f"would set {k}" for k in d if d.get(k)]
+            return "; ".join(done) or "none"
+        if d.get("terminal") and "defaults" in sel_cats:
+            (CFG).mkdir(parents=True, exist_ok=True)
+            (CFG / "xdg-terminals.list").write_text(
+                "# Terminal emulator preference order for xdg-terminal-exec\n"
+                f"{name_to_desktop(d['terminal'])}\n")
+            done.append(f"terminal={d['terminal']}")
+        if d.get("browser") and "defaults" in sel_cats:
+            mime = CFG / "mimeapps.list"
+            text = mime.read_text() if mime.exists() else "[Default Applications]\n"
+            did = name_to_desktop(d["browser"])
+            for key in ("text/html", "x-scheme-handler/http",
+                        "x-scheme-handler/https"):
+                pat = re.compile(rf"^{re.escape(key)}=.*$", re.M)
+                if pat.search(text):
+                    text = pat.sub(f"{key}={did}", text)
+                else:
+                    text = text.rstrip() + f"\n{key}={did}\n"
+            mime.write_text(text)
+            done.append(f"browser={d['browser']}")
+        if d.get("editor") and "defaults" in sel_cats:
+            p = OMSTATE / "defaults" / "editor"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(d["editor"] + "\n")
+            done.append(f"editor={d['editor']}")
+        if d.get("agent") and "defaults" in sel_cats:
+            p = CFG / "omarchy" / "defaults" / "agent"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(d["agent"] + "\n")
+            done.append(f"agent={d['agent']}")
+        theme = d.get("theme")
+        if theme and "themes" in sel_cats and has("omarchy"):
+            r = run(["omarchy", "theme", "set", theme])
+            log(r.stdout or f"theme set {theme}")
+            done.append(f"theme={theme}")
+            bg = d.get("background")
+            if bg:
+                bgp = CFG / "omarchy" / bg
+                if bgp.exists():
+                    run(["omarchy", "theme", "bg", "set", str(bgp)])
+                    done.append("background")
+        return "; ".join(done)
+
+    def step_restart():
+        if dry:
+            return "dry run"
+        cmds = [["omarchy", "restart", "shell"], ["omarchy", "restart", "hyprctl"]]
+        if any(s.startswith(".config/foot") or s.startswith(".config/alacritty")
+               or s.startswith(".config/kitty") or s.startswith(".config/ghostty")
+               for s in sel_rels):
+            cmds.append(["omarchy", "restart", "terminal"])
+        out = []
+        for c in cmds:
+            if not has(c[0]):
+                continue
+            r = run(c)
+            if r.returncode == 0:
+                out.append(c[2])
+        return f"restarted: {', '.join(out)}" if out else "no restarts needed"
+
+    def step_verify():
+        if dry:
+            return "dry run"
+        ok = missing = 0
+        for f in manifest.get("files", []):
+            p = HOME / f["rel"]
+            if p.exists() and p.stat().st_size == f["bytes"]:
+                ok += 1
+            else:
+                missing += 1
+        return f"{ok} verified, {missing} missing"
+
+    apply_step(events, "backup", "Backing up current configs", step_backup)
+    apply_step(events, "files", "Restoring files", step_files)
+    apply_step(events, "packages", "Installing packages", step_packages)
+    apply_step(events, "plugins", "Syncing shell plugins", step_plugins)
+    apply_step(events, "themes", "Syncing themes", step_themes)
+    apply_step(events, "defaults", "Applying defaults & theme", step_defaults)
+    apply_step(events, "restart", "Restarting services", step_restart)
+    apply_step(events, "verify", "Verifying", step_verify)
+
+    shutil.rmtree(tmp, ignore_errors=True)
+    ok = True
+    emit(events, {"event": "done", "ok": ok, "dry_run": dry, "stats": stats,
+                  "backup_dir": str(backup_dir)})
+    if not args.events:
+        print(f"Apply {'(dry run) ' if dry else ''}done: {stats}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# serve
+# ---------------------------------------------------------------------------
+
+def lan_ips():
+    ips = []
+    try:
+        out = run(["hostname", "-I"]).stdout.split()
+        ips = [ip for ip in out if ip.startswith("192.168") or ip.startswith("10.")
+               or ip.startswith("172.")]
+    except FileNotFoundError:
+        pass
+    if not ips:
+        try:
+            ips = [socket.gethostbyname(socket.gethostname())]
+        except OSError:
+            ips = ["127.0.0.1"]
+    return ips or ["127.0.0.1"]
+
+
+SERVE_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Omamigrate — {host}</title>
+<style>
+body{{font-family:system-ui,sans-serif;background:#0a0a0f;color:#e6e6e6;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}}
+.card{{max-width:560px;padding:40px;border:1px solid #ffffff14;border-radius:20px;
+background:#14141c;text-align:center}}
+h1{{margin:0 0 8px;font-size:28px}} h1 span{{color:{accent}}}
+p{{color:#999;line-height:1.5}}
+a.btn{{display:inline-block;margin-top:24px;padding:14px 28px;background:{accent};
+color:#fff;text-decoration:none;border-radius:12px;font-size:16px;font-weight:600}}
+code{{background:#00000055;padding:2px 6px;border-radius:6px}}
+</style></head><body><div class="card">
+<h1>📦 <span>omamigrate</span></h1>
+<p>Hi! This is <b>{host}</b>. Your Omarchy setup is packed and ready.<br>
+On the new machine, install <code>omamigrate</code>, open the dashboard,
+pick <b>Receive</b>, and grab the bundle:</p>
+<a class="btn" href="/{token}/{fname}">Download bundle ({size})</a>
+<p style="margin-top:20px;font-size:13px">or: <code>curl -OJ {url}</code></p>
+</div></body></html>"""
+
+
+def make_serve_handler(bundle, token, manifest_bytes):
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = urllib.parse.urlparse(self.path).path.strip("/")
+            parts = path.split("/")
+            if len(parts) != 2 or parts[0] != token:
+                self._send(404, "not found")
+                return
+            name = parts[1]
+            if name == "":
+                page = SERVE_PAGE.format(
+                    host=socket.gethostname(), accent="#0072CE", token=token,
+                    fname=bundle.name, size=human(bundle.stat().st_size),
+                    url=f"http://{lan_ips()[0]}:{self.server.server_address[1]}/{token}/{bundle.name}")
+                self._send(200, page.encode(), "text/html; charset=utf-8")
+            elif name == "manifest.json":
+                self._send(200, manifest_bytes, "application/json")
+            elif name == bundle.name:
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 "application/x-tar")
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{bundle.name}"')
+                self.send_header("Content-Length",
+                                 str(bundle.stat().st_size))
+                self.end_headers()
+                with open(bundle, "rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            else:
+                self._send(404, "not found")
+
+    return H
+
+
+def cmd_serve(args):
+    events = args.events
+    bundle = Path(args.bundle) if args.bundle else newest(
+        list(BUNDLE_DIR.glob("omamigrate-*.tar.*")))
+    if not bundle or not bundle.exists():
+        print("No bundle found. Run: omamigrate pack --all", file=sys.stderr)
+        return 1
+    token = secrets.token_urlsafe(6)
+    port = args.port
+    if not port:
+        port = 8787
+        while True:
+            s = socket.socket()
+            try:
+                s.bind(("0.0.0.0", port))
+                s.close()
+                break
+            except OSError:
+                port += 1
+            if port > 8797:
+                break
+    manifest_bytes = b"{}"
+    try:
+        manifest_bytes = json.dumps(read_manifest(bundle)).encode()
+    except Exception:
+        pass
+    server = ThreadingHTTPServer(("0.0.0.0", port),
+                                 make_serve_handler(bundle, token, manifest_bytes))
+    urls = [f"http://{ip}:{port}/{token}/" for ip in lan_ips()]
+    emit(events, {"event": "serving", "urls": urls, "port": port,
+                  "token": token, "file": str(bundle),
+                  "bytes": bundle.stat().st_size})
+    if not events:
+        print(f"Serving {bundle.name} ({human(bundle.stat().st_size)}):")
+        for u in urls:
+            print(f"  {u}")
+        print("Stop with Ctrl-C.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# agent
+# ---------------------------------------------------------------------------
+
+AGENT_PROMPT = """# Omamigrate: you are the migration agent
+
+You are guiding the user through migrating their Omarchy customizations
+from one machine to another. The `omamigrate` CLI does ALL the real work
+(deterministic scripts). You narrate, ask questions, and run its commands.
+Never copy, move or edit config files yourself — always go through omamigrate,
+which backs up anything it overwrites.
+
+## Commands (all support --json / --events where noted)
+- `omamigrate scan` — inventory this machine (categories with sizes)
+- `omamigrate pack --all --out <path>` — carbon-copy bundle of everything
+- `omamigrate pack --select shell,themes,hyprland --out <path>` — selective
+- `omamigrate serve` — serve the newest bundle over the LAN, prints URLs
+- `omamigrate unpack <bundle>` — inspect any bundle's manifest
+- `omamigrate apply <bundle> [--select ...] [--dry-run]` — restore on this machine
+- `omamigrate verify <bundle>` — check what a bundle restored
+- `omamigrate gui` — the animated dashboard (offer this any time)
+
+## Flow
+1. Ask ONE question first: "Are we on the OLD machine (sending) or the NEW machine (receiving)?"
+2. OLD machine:
+   a. Run `omamigrate scan` and summarize the categories in plain, friendly words.
+   b. Ask: "Carbon copy (everything you customized) or pick specific things?"
+   c. For selective, list the category ids and let them choose.
+   d. Run `omamigrate pack --all` (or `--select ...`). Report bundle path + size.
+   e. Run `omamigrate serve` in the background and give them the URL. Tell them:
+      "On the new machine: install omamigrate, open the dashboard, choose
+      Receive, and paste that URL."
+3. NEW machine:
+   a. Ask for the bundle: a URL from the old machine, or a local file path.
+   b. If URL: `curl -L -o ~/.omamigrate/inbox/bundle.tar.zst <url>`.
+   c. Run `omamigrate unpack <bundle>` and summarize what it contains
+      (host, omarchy version, files, packages, plugins, themes).
+   d. Ask what to apply (default: everything in the bundle; secrets/personal
+      files are opt-in and only included if the old machine packed them).
+   e. Offer `omamigrate apply <bundle> --dry-run` first if they seem unsure.
+   f. Run `omamigrate apply <bundle>`. Watch the step events, report each
+      step as it completes (backup → files → packages → plugins → themes →
+      defaults → restart → verify).
+   g. Run `omamigrate verify <bundle>` and report the result.
+4. Celebrate. One line, with personality.
+
+## Style & safety
+- Warm, brief, one question at a time. Show each command before running it.
+- If a command fails, stop, show the error, and suggest a fix.
+- Never include secrets unless the user explicitly asks for them.
+- If the user just wants the pretty one, suggest `omamigrate gui`.
+"""
+
+
+def cmd_agent(args):
+    prompt = AGENT_PROMPT
+    agent = default_agent()
+    if not agent:
+        print("No default agent set. Pick one first:", file=sys.stderr)
+        print("  omarchy default agent <name>", file=sys.stderr)
+        return 1
+    if args.prompt_only:
+        print(prompt)
+        return 0
+    if args.new_window or not sys.stdin.isatty():
+        subprocess.Popen(
+            ["omarchy", "agent", "prompt", prompt],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        print(f"Agent ({agent}) is taking the wheel — a terminal window is opening.")
+    else:
+        print(f"Handing the wheel to your agent ({agent}).")
+        r = subprocess.run(["omarchy", "agent", "prompt", "--inline", prompt])
+        return r.returncode
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# gui
+# ---------------------------------------------------------------------------
+
+def latest_bundle():
+    return newest(list(BUNDLE_DIR.glob("omamigrate-*.tar.*")))
+
+
+GUI_PROCS = {}
+
+
+def spawn_stream(args_list):
+    return subprocess.Popen(args_list, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True,
+                            bufsize=1)
+
+
+def stream_proc(proc):
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                yield {"event": "log", "line": line}
+    finally:
+        proc.wait()
+
+
+def make_gui_handler(page_html):
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _json(self, obj, code=200):
+            body = json.dumps(obj, default=str).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _sse(self, gen):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            for ev in gen:
+                try:
+                    self.wfile.write(
+                        f"data: {json.dumps(ev, default=str)}\n\n".encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+        def _body(self):
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n) or b"{}")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def do_GET(self):
+            path = urllib.parse.urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                body = page_html.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == "/api/health":
+                self._json({"ok": True, "version": VERSION, "host": socket.gethostname()})
+            else:
+                self._json({"error": "not found"}, 404)
+
+        def do_POST(self):
+            path = urllib.parse.urlparse(self.path).path
+            try:
+                if path == "/api/scan":
+                    self._json(build_inventory())
+                elif path == "/api/pack":
+                    b = self._body()
+                    out = b.get("out") or str(
+                        BUNDLE_DIR /
+                        f"omamigrate-{socket.gethostname()}-{datetime.now():%Y%m%d-%H%M%S}.tar.zst")
+                    sel = b.get("select")
+                    cmd = [sys.executable, os.path.abspath(__file__), "pack",
+                           "--events", "--out", out]
+                    if b.get("carbon"):
+                        cmd.append("--all")
+                    elif sel:
+                        cmd += ["--select", ",".join(sel)]
+                    proc = spawn_stream(cmd)
+                    self._sse(stream_proc(proc))
+                elif path == "/api/serve":
+                    b = self._body()
+                    if GUI_PROCS.get("serve") and GUI_PROCS["serve"].poll() is None:
+                        self._json(GUI_PROCS.get("served") or {"error": "already serving"})
+                        return
+                    bundle = b.get("bundle") or (latest_bundle() and str(latest_bundle()))
+                    if not bundle:
+                        self._json({"error": "no bundle — pack one first"}, 400)
+                        return
+                    proc = spawn_stream(
+                        [sys.executable, os.path.abspath(__file__), "serve",
+                         "--events", "--bundle", bundle])
+                    line = proc.stdout.readline()
+                    try:
+                        first = json.loads(line)
+                    except json.JSONDecodeError:
+                        first = {"error": f"serve failed: {line.strip()}"}
+                    if first.get("event") != "serving":
+                        proc.kill()
+                        self._json(first, 500)
+                        return
+                    GUI_PROCS["serve"] = proc
+                    GUI_PROCS["served"] = first
+                    self._json(first)
+                elif path == "/api/stop":
+                    p = GUI_PROCS.get("serve")
+                    if p and p.poll() is None:
+                        p.terminate()
+                    GUI_PROCS.pop("serve", None)
+                    GUI_PROCS.pop("served", None)
+                    self._json({"ok": True})
+                elif path == "/api/load":
+                    b = self._body()
+                    self._sse(self._load_gen(b))
+                elif path == "/api/apply":
+                    b = self._body()
+                    bundle = b.get("bundle")
+                    if not bundle:
+                        self._json({"error": "no bundle"}, 400)
+                        return
+                    cmd = [sys.executable, os.path.abspath(__file__), "apply",
+                           bundle, "--events"]
+                    if b.get("dry_run"):
+                        cmd.append("--dry-run")
+                    if b.get("select"):
+                        cmd += ["--select", ",".join(b["select"])]
+                    if b.get("exclude"):
+                        cmd += ["--exclude", ",".join(b["exclude"])]
+                    proc = spawn_stream(cmd)
+                    self._sse(stream_proc(proc))
+                elif path == "/api/verify":
+                    b = self._body()
+                    r = subprocess.run(
+                        [sys.executable, os.path.abspath(__file__), "verify",
+                         b.get("bundle", "")], capture_output=True, text=True)
+                    try:
+                        self._json(json.loads(r.stdout))
+                    except json.JSONDecodeError:
+                        self._json({"error": r.stderr or r.stdout}, 500)
+                elif path == "/api/agent":
+                    agent = default_agent()
+                    if not agent:
+                        self._json({"error": "no default agent set"}, 400)
+                        return
+                    subprocess.Popen(
+                        ["omarchy", "agent", "prompt", AGENT_PROMPT],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True)
+                    self._json({"ok": True, "agent": agent})
+                else:
+                    self._json({"error": "not found"}, 404)
+            except Exception as e:
+                self._json({"error": str(e)}, 500)
+
+        def _load_gen(self, b):
+            url = b.get("url")
+            dest_path = b.get("path")
+            if url:
+                dest = INBOX / Path(urllib.parse.urlparse(url).path.split("/")[-1]
+                                    or "bundle.tar.zst")
+                INBOX.mkdir(parents=True, exist_ok=True)
+                total = None
+                done = 0
+                try:
+                    req = urllib.request.Request(url)
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        total = int(r.headers.get("Content-Length", 0)) or None
+                        with open(dest, "wb") as f:
+                            while True:
+                                chunk = r.read(1024 * 256)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                done += len(chunk)
+                                yield {"event": "download", "done": done,
+                                       "total": total or done}
+                except Exception as e:
+                    yield {"event": "error", "line": str(e)}
+                    return
+                dest_path = str(dest)
+            if not dest_path or not Path(dest_path).exists():
+                yield {"event": "error", "line": "bundle not found"}
+                return
+            yield from self._manifest_gen(dest_path)
+
+        def _manifest_gen(self, dest_path):
+            try:
+                m = read_manifest(dest_path)
+            except Exception as e:
+                yield {"event": "error", "line": f"cannot read bundle: {e}"}
+                return
+            yield {"event": "ready", "path": dest_path, "manifest": m}
+
+    return H
+
+
+def build_page():
+    colors = theme_colors() or {}
+    theme_css = f"""
+:root {{
+  --bg: {colors.get('background', '#0a0a0f')};
+  --bg2: {colors.get('lighter_background', '#1b1c21')};
+  --fg: {colors.get('foreground', '#e6e6e6')};
+  --muted: {colors.get('muted', '#8a8f98')};
+  --accent: {colors.get('accent', '#0072CE')};
+  --green: {colors.get('green', '#79bc6e')};
+  --red: {colors.get('red', '#e06c75')};
+  --yellow: {colors.get('yellow', '#e5c07b')};
+  --cyan: {colors.get('cyan', '#56b6c2')};
+  --magenta: {colors.get('magenta', '#c678dd')};
+}}"""
+    return HTML.replace("/*__THEME__*/", theme_css).replace(
+        "__VERSION__", VERSION).replace("__HOST__", socket.gethostname())
+
+
+def cmd_gui(args):
+    BUNDLE_DIR.mkdir(parents=True, exist_ok=True)
+    INBOX.mkdir(parents=True, exist_ok=True)
+    port = args.port or 0
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_gui_handler(build_page()))
+    port = server.server_address[1]
+    url = f"http://127.0.0.1:{port}"
+    print(f"omamigrate dashboard: {url}", file=sys.stderr)
+    if (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")) \
+            and has("xdg-open"):
+        try:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# install-menu
+# ---------------------------------------------------------------------------
+
+def cmd_install_menu(args):
+    menu = CFG / "omarchy" / "extensions" / "omarchy-menu.jsonc"
+    if menu.exists():
+        text = menu.read_text()
+    else:
+        menu.parent.mkdir(parents=True, exist_ok=True)
+        text = "{\n}\n"
+    text = re.sub(r'\n?\s*"omamigrate":\s*\{[^}]*\},?', "", text)
+    installed = os.path.join(str(HOME), ".local", "bin", "omamigrate")
+    exe = os.path.abspath(
+        os.environ.get("OMAMIGRATE_BIN",
+                       installed if os.path.exists(installed) else __file__))
+    entry = ('  "omamigrate": {"icon":"📦","label":"Omamigrate",'
+             '"action":"' + exe + '","description":'
+             '"Move your Omarchy to a new machine"},\n')
+    idx = text.rfind("}")
+    text = text[:idx] + entry + text[idx:]
+    menu.write_text(text)
+    print(f"Menu entry added to {menu}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>omamigrate · __HOST__</title>
+<style>
+/*__THEME__*/
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --panel:color-mix(in srgb, var(--bg2) 78%, transparent);
+  --line:color-mix(in srgb, var(--fg) 14%, transparent);
+  --glow:color-mix(in srgb, var(--accent) 45%, transparent);
+}
+html,body{height:100%}
+body{
+  font:15px/1.5 ui-sans-serif,system-ui,"Segoe UI",sans-serif;
+  background:var(--bg);color:var(--fg);overflow-x:hidden;
+}
+#bg{position:fixed;inset:0;z-index:0}
+#confetti{position:fixed;inset:0;z-index:60;pointer-events:none}
+.wrap{position:relative;z-index:1;max-width:1060px;margin:0 auto;padding:28px 22px 80px}
+/* top bar */
+.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px}
+.wordmark{
+  font-weight:800;font-size:22px;letter-spacing:-.5px;cursor:pointer;
+  background:linear-gradient(90deg,var(--accent),var(--cyan),var(--magenta),var(--accent));
+  background-size:300% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;
+  animation:flow 6s linear infinite;
+}
+@keyframes flow{to{background-position:300% 0}}
+.ver{color:var(--muted);font-size:12.5px;font-family:ui-monospace,monospace}
+/* views */
+.view{display:none;animation:rise .45s cubic-bezier(.2,.8,.2,1) both}
+.view.on{display:block}
+@keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+/* landing */
+.hero{text-align:center;margin:9vh 0 34px}
+.hero h1{
+  font-size:40px;font-weight:800;letter-spacing:-1px;
+  background:linear-gradient(90deg,var(--accent),var(--cyan),var(--magenta),var(--accent));
+  background-size:300% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;
+  animation:flow 6s linear infinite;
+}
+.hero p{color:var(--muted);margin-top:10px;max-width:520px;margin-inline:auto}
+.duo{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:720px){.duo{grid-template-columns:1fr}}
+.bigcard{
+  position:relative;border:1px solid var(--line);border-radius:20px;padding:30px 26px;
+  background:var(--panel);cursor:pointer;overflow:hidden;
+  transition:transform .25s,border-color .25s,box-shadow .25s;
+}
+.bigcard:hover{transform:translateY(-4px);border-color:var(--accent);box-shadow:0 18px 50px -18px var(--glow)}
+.bigcard .em{font-size:38px}
+.bigcard h3{font-size:20px;margin:12px 0 6px}
+.bigcard p{color:var(--muted);font-size:14px}
+.bigcard .arrow{position:absolute;right:22px;top:26px;font-size:22px;color:var(--muted);transition:.25s}
+.bigcard:hover .arrow{color:var(--accent);transform:translateX(5px)}
+.agentline{margin-top:18px;text-align:center}
+/* buttons */
+.btn{
+  border:1px solid var(--line);background:var(--bg2);color:var(--fg);
+  padding:10px 18px;border-radius:11px;font-size:14px;font-weight:600;cursor:pointer;
+  transition:.2s;
+}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 8px 26px -10px var(--glow)}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost{background:transparent}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.danger{border-color:var(--red);color:var(--red)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.spread{justify-content:space-between}
+/* section heads */
+.shead{display:flex;align-items:center;gap:12px;margin:26px 0 14px}
+.shead h2{font-size:17px}
+.shead .sub{color:var(--muted);font-size:13px}
+/* carbon switch */
+.switch{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.switch input{display:none}
+.track{width:46px;height:26px;border-radius:20px;background:var(--bg2);border:1px solid var(--line);position:relative;transition:.25s}
+.thumb{position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:var(--muted);transition:.25s cubic-bezier(.3,1.4,.5,1)}
+.switch input:checked + .track{background:var(--accent);border-color:var(--accent)}
+.switch input:checked + .track .thumb{left:22px;background:#fff}
+.swlabel{font-weight:600;font-size:14px}
+/* category grid */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+.card{
+  border:1px solid var(--line);border-radius:14px;padding:14px;background:var(--panel);
+  cursor:pointer;position:relative;transition:.2s;opacity:0;animation:pop .4s both;
+}
+@keyframes pop{from{opacity:0;transform:scale(.94) translateY(8px)}to{opacity:1;transform:none}}
+.card:hover{border-color:color-mix(in srgb,var(--accent) 55%,transparent);transform:translateY(-2px)}
+.card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.card .ic{font-size:22px}
+.card h4{font-size:14.5px;margin:8px 0 2px}
+.card .meta{color:var(--muted);font-size:12px;font-family:ui-monospace,monospace}
+.card .badge{position:absolute;top:12px;right:12px;font-size:10.5px;color:var(--yellow);border:1px solid var(--yellow);border-radius:20px;padding:1px 8px}
+.card .tick{position:absolute;bottom:12px;right:12px;width:20px;height:20px;border-radius:6px;border:1.5px solid var(--line);display:grid;place-items:center;font-size:13px;color:#fff;transition:.2s}
+.card.sel .tick{background:var(--accent);border-color:var(--accent)}
+.card .items{margin-top:8px;display:none;max-height:150px;overflow:auto;border-top:1px solid var(--line);padding-top:8px}
+.card.open .items{display:block}
+.card .items div{font-size:12px;color:var(--muted);padding:2px 0;font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* progress */
+.pbox{border:1px solid var(--line);border-radius:16px;padding:26px;background:var(--panel);text-align:center}
+.ring{width:150px;height:150px;margin:0 auto 8px;position:relative}
+.ring svg{transform:rotate(-90deg)}
+.ring .track{fill:none;stroke:var(--bg2);stroke-width:12}
+.ring .bar{fill:none;stroke:var(--accent);stroke-width:12;stroke-linecap:round;transition:stroke-dashoffset .35s;filter:drop-shadow(0 0 6px var(--glow))}
+.ring .num{position:absolute;inset:0;display:grid;place-items:center;font-size:26px;font-weight:800}
+.ring .num small{display:block;font-size:11px;color:var(--muted);font-weight:500;text-align:center}
+.ticker{font-family:ui-monospace,monospace;font-size:12.5px;color:var(--muted);margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bignum{font-size:15px;font-weight:700;margin-top:6px}
+/* console */
+.console{
+  margin-top:14px;background:color-mix(in srgb,black 30%,var(--bg));border:1px solid var(--line);
+  border-radius:12px;padding:12px;height:170px;overflow:auto;font-family:ui-monospace,monospace;
+  font-size:12px;text-align:left;
+}
+.console .ln{white-space:pre-wrap;word-break:break-all;color:color-mix(in srgb,var(--fg) 82%,transparent);animation:lnin .25s both}
+@keyframes lnin{from{opacity:0;transform:translateX(-6px)}to{opacity:1;transform:none}}
+.console .ln.err{color:var(--red)}
+.console .ln.ok{color:var(--green)}
+/* bundle ready */
+.bundle{
+  border:1px solid var(--green);border-radius:16px;padding:22px;background:var(--panel);
+  box-shadow:0 0 40px -18px var(--green);
+}
+.bundle .path{font-family:ui-monospace,monospace;font-size:13px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px 12px;word-break:break-all;margin:10px 0}
+.urlbox{display:flex;gap:8px;margin-top:12px}
+.urlbox input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:10px 12px;font-family:ui-monospace,monospace;font-size:13px}
+/* receive input */
+.recin{display:flex;gap:10px;margin-top:14px}
+.recin input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:11px;padding:13px 14px;font-family:ui-monospace,monospace;font-size:13.5px}
+.recin input:focus{outline:none;border-color:var(--accent)}
+/* manifest */
+.mani{border:1px solid var(--line);border-radius:16px;padding:20px;background:var(--panel);margin-top:16px}
+.mani .mrow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
+.mani .mrow:last-child{border:0}
+.mani .k{color:var(--muted)}
+.chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}
+.chip{font-size:12px;border:1px solid var(--line);border-radius:20px;padding:3px 11px;color:var(--fg);background:var(--bg)}
+.chip b{color:var(--accent)}
+/* steps timeline */
+.steps{margin-top:16px;border:1px solid var(--line);border-radius:16px;padding:20px;background:var(--panel)}
+.step{display:flex;gap:14px;align-items:flex-start;padding:11px 0;position:relative}
+.step:not(:last-child)::before{content:"";position:absolute;left:15px;top:40px;bottom:-4px;width:2px;background:var(--line)}
+.step .dot{
+  width:32px;height:32px;border-radius:50%;border:2px solid var(--line);display:grid;place-items:center;
+  font-size:14px;flex:none;background:var(--bg);transition:.3s;
+}
+.step .st{font-weight:600;font-size:14.5px;padding-top:2px}
+.step .sd{color:var(--muted);font-size:12.5px;font-family:ui-monospace,monospace}
+.step.run .dot{border-color:var(--accent);box-shadow:0 0 0 0 var(--glow);animation:pulse 1.2s infinite}
+.step.run .dot::after{content:"";width:12px;height:12px;border-radius:50%;background:var(--accent);animation:spin 1s linear infinite;border:2px solid transparent;border-top-color:#fff}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%{box-shadow:0 0 0 0 var(--glow)}70%{box-shadow:0 0 0 10px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.step.done .dot{background:var(--green);border-color:var(--green);color:#fff;animation:pop .35s}
+.step.done .dot::after{content:"✓"}
+.step.err .dot{background:var(--red);border-color:var(--red);color:#fff;animation:pop .35s}
+.step.err .dot::after{content:"✕"}
+.step.err .st{color:var(--red)}
+/* done */
+.done{
+  text-align:center;border:1px solid var(--green);border-radius:18px;padding:38px;background:var(--panel);
+  box-shadow:0 0 60px -20px var(--green);animation:pop .5s both;
+}
+.done .big{font-size:52px}
+.done h2{font-size:24px;margin:12px 0 6px}
+.done p{color:var(--muted)}
+/* toast */
+#toast{
+  position:fixed;bottom:26px;left:50%;transform:translateX(-50%) translateY(20px);
+  background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:11px 20px;
+  font-size:14px;opacity:0;pointer-events:none;transition:.3s;z-index:70;box-shadow:0 10px 40px -10px #000;
+}
+#toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.err{border-color:var(--red);color:var(--red)}
+/* misc */
+.muted{color:var(--muted)}
+.mono{font-family:ui-monospace,monospace}
+.center{text-align:center}
+.mt{margin-top:16px}
+.hidden{display:none!important}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--muted);border-top-color:var(--fg);border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<canvas id="confetti"></canvas>
+<div class="wrap">
+  <div class="top">
+    <div class="wordmark" onclick="go('landing')">⌘ omamigrate</div>
+    <div class="ver">v__VERSION__ · __HOST__</div>
+  </div>
+
+  <!-- LANDING -->
+  <section class="view on" id="v-landing">
+    <div class="hero">
+      <h1>Move your omarchy</h1>
+      <p>Every theme, plugin, keybinding and package you have shaped — carried from one machine to the next. Nothing left behind.</p>
+    </div>
+    <div class="duo">
+      <div class="bigcard" onclick="startSend()">
+        <div class="arrow">→</div>
+        <div class="em">📤</div>
+        <h3>Send from here</h3>
+        <p>Pack this machine's customizations into a portable bundle and share it over the network.</p>
+      </div>
+      <div class="bigcard" onclick="startReceive()">
+        <div class="arrow">→</div>
+        <div class="em">📥</div>
+        <h3>Receive here</h3>
+        <p>Drop in a bundle from your old machine and watch this one become it — step by step.</p>
+      </div>
+    </div>
+    <div class="agentline">
+      <button class="btn ghost" onclick="startAgent()">🤖 Let the agent walk me through it</button>
+    </div>
+  </section>
+
+  <!-- SEND -->
+  <section class="view" id="v-send">
+    <div class="shead spread">
+      <div><h2>What to take</h2><span class="sub" id="send-sub"></span></div>
+      <label class="switch" title="Grab everything, including opt-in extras">
+        <input type="checkbox" id="carbon" onchange="carbonToggle()">
+        <span class="track"><span class="thumb"></span></span>
+        <span class="swlabel">Carbon copy</span>
+      </label>
+    </div>
+    <div class="grid" id="cat-grid"></div>
+    <div class="row mt spread">
+      <button class="btn ghost" onclick="go('landing')">← back</button>
+      <div class="row">
+        <span class="muted" id="sel-sum"></span>
+        <button class="btn primary" id="pack-btn" onclick="doPack()">Pack it up →</button>
+      </div>
+    </div>
+
+    <!-- packing progress -->
+    <div class="hidden mt" id="send-progress">
+      <div class="pbox">
+        <div class="ring">
+          <svg width="150" height="150"><circle class="track" cx="75" cy="75" r="66"/><circle class="bar" id="ring-bar" cx="75" cy="75" r="66"/></svg>
+          <div class="num"><div><span id="ring-pct">0%</span><small id="ring-sub">gathering</small></div></div>
+        </div>
+        <div class="bignum" id="pack-size">0 B</div>
+        <div class="ticker" id="pack-tick">warming up…</div>
+        <div class="console" id="pack-console"></div>
+      </div>
+    </div>
+
+    <!-- bundle ready -->
+    <div class="hidden mt" id="send-ready">
+      <div class="bundle">
+        <div class="center" style="font-size:40px">📦</div>
+        <h3 class="center" style="margin-top:8px">Bundle ready</h3>
+        <p class="center muted" id="bundle-meta"></p>
+        <div class="path" id="bundle-path"></div>
+        <div class="row spread center">
+          <button class="btn" onclick="copyPath()">⧉ copy path</button>
+          <button class="btn primary" id="serve-btn" onclick="doServe()">📡 share over LAN</button>
+        </div>
+        <div class="hidden" id="serve-box">
+          <div class="urlbox">
+            <input id="serve-url" readonly>
+            <button class="btn" onclick="copyUrl()">copy</button>
+            <button class="btn danger" onclick="stopServe()">stop</button>
+          </div>
+          <p class="muted center mt" style="font-size:12.5px">Open this on the new machine, or paste it into "Receive here" there.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RECEIVE -->
+  <section class="view" id="v-receive">
+    <div class="shead spread">
+      <div><h2>Where from?</h2><span class="sub">A share link from your old machine, or a bundle file on disk.</span></div>
+      <button class="btn ghost" onclick="go('landing')">← back</button>
+    </div>
+    <div id="recv-input">
+      <div class="recin">
+        <input id="recv-url" placeholder="http://old-machine:PORT/?token=…   or   /path/to/bundle.tar.zst">
+        <button class="btn primary" id="load-btn" onclick="doLoad()">Load bundle →</button>
+      </div>
+    </div>
+
+    <div class="hidden mt" id="recv-progress">
+      <div class="pbox">
+        <div class="bignum" id="dl-pct">0%</div>
+        <div class="ticker" id="dl-tick">downloading…</div>
+        <div class="console" id="dl-console"></div>
+      </div>
+    </div>
+
+    <div class="hidden" id="recv-mani">
+      <div class="mani" id="mani-box"></div>
+      <div class="row mt spread">
+        <label class="switch"><input type="checkbox" id="dry"><span class="track"><span class="thumb"></span></span><span class="swlabel" style="font-size:13px">Dry run (preview, change nothing)</span></label>
+        <button class="btn primary" id="apply-btn" onclick="doApply()">⚡ Apply to this machine</button>
+      </div>
+    </div>
+
+    <div class="hidden mt" id="recv-apply">
+      <div class="steps" id="step-list"></div>
+      <div class="console mt" id="apply-console"></div>
+    </div>
+
+    <div class="hidden mt" id="recv-done">
+      <div class="done">
+        <div class="big">🎉</div>
+        <h2 id="done-title">All set</h2>
+        <p id="done-sub"></p>
+        <div class="row center mt" id="done-actions"></div>
+      </div>
+    </div>
+  </section>
+</div>
+<div id="toast"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const CIRC=2*Math.PI*66;
+let INV=null, BUNDLE=null, SERVING=false, lastCat=new Set(), agentDone=false;
+$("#ring-bar").style.strokeDasharray=CIRC;
+$("#ring-bar").style.strokeDashoffset=CIRC;
+
+function toast(msg,err){
+  const t=$("#toast");t.textContent=msg;t.className=err?"on err":"on";
+  clearTimeout(t._t);t._t=setTimeout(()=>t.className="",2600);
+}
+function human(b){
+  if(b==null)return"0 B";
+  const u=["B","KB","MB","GB","TB"];let i=0;
+  while(b>=1024&&i<u.length-1){b/=1024;i++}
+  return b.toFixed(b<10&&i>0?1:0)+" "+u[i];
+}
+function el(tag,cls,html){const e=document.createElement(tag);if(cls)e.className=cls;if(html!=null)e.innerHTML=html;return e}
+function log(box,line,cls){
+  const c=$(box);const l=el("div","ln"+(cls?" "+cls:""),line);c.appendChild(l);
+  while(c.children.length>400)c.removeChild(c.firstChild);c.scrollTop=c.scrollHeight;
+}
+async function api(path,body){
+  const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+  return r.json();
+}
+async function sse(path,body,onEv){
+  const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+  const rd=r.body.getReader();const dec=new TextDecoder();let buf="";
+  while(true){
+    const {done,value}=await rd.read();
+    if(done)break;
+    buf+=dec.decode(value,{stream:true});
+    let i;
+    while((i=buf.indexOf("\n\n"))>=0){
+      const chunk=buf.slice(0,i);buf=buf.slice(i+2);
+      for(const line of chunk.split("\n")){
+        if(line.startsWith("data: ")){try{onEv(JSON.parse(line.slice(6)))}catch(e){}}
+      }
+    }
+  }
+}
+function go(v){
+  document.querySelectorAll(".view").forEach(x=>x.classList.remove("on"));
+  $("#v-"+v).classList.add("on");window.scrollTo({top:0,behavior:"smooth"});
+}
+
+/* ---------- SEND ---------- */
+async function startSend(){
+  go("send");
+  $("#send-sub").innerHTML='<span class="spin"></span> scanning this machine…';
+  $("#cat-grid").innerHTML="";
+  try{
+    INV=await api("/api/scan",{});
+  }catch(e){$("#send-sub").textContent="scan failed: "+e;return}
+  $("#send-sub").textContent=`${INV.host} · omarchy ${INV.omarchy||"?"} · ${INV.user}`;
+  renderCats();
+}
+function renderCats(){
+  const g=$("#cat-grid");g.innerHTML="";
+  lastCat=new Set();
+  INV.categories.forEach((c,i)=>{
+    if(!c.items.length&&!c.meta)return;
+    const card=el("div","card");
+    card.style.animationDelay=(i*45)+"ms";
+    card.innerHTML=`<div class="ic">${c.icon}</div><h4>${c.label}</h4>
+      <div class="meta">${c.meta&&c.meta.count!=null?c.meta.count+" packages":c.files+" files · "+human(c.bytes)}</div>
+      ${c.optin?'<span class="badge">opt-in</span>':""}
+      <div class="tick">✓</div><div class="items"></div>`;
+    const itemsBox=card.querySelector(".items");
+    c.items.slice(0,60).forEach(function(it){
+      var label=it.label;
+      if(it.files>1){label=label+" ("+it.files+")";}
+      itemsBox.appendChild(el("div",null,label));
+    });
+    if(c.items.length>60)itemsBox.appendChild(el("div",null,"… and "+(c.items.length-60)+" more"));
+    card.onclick=e=>{
+      if($("#carbon").checked)return;
+      card.classList.toggle("sel");
+      if(card.classList.contains("sel"))lastCat.add(c.id);else lastCat.delete(c.id);
+      updateSelSum();
+      e.stopPropagation();
+    };
+    g.appendChild(card);
+  });
+  updateSelSum();
+}
+function carbonToggle(){
+  const on=$("#carbon").checked;
+  document.querySelectorAll("#cat-grid .card").forEach(c=>c.classList.toggle("sel",on));
+  if(on)lastCat=new Set(INV.categories.map(c=>c.id));else lastCat.clear();
+  updateSelSum();
+}
+function updateSelSum(){
+  let files=0,bytes=0,n=0;
+  INV.categories.forEach(c=>{
+    const on=$("#carbon").checked||lastCat.has(c.id);
+    if(on){files+=c.files;bytes+=c.bytes;n++}
+  });
+  $("#sel-sum").textContent=n+" of "+INV.categories.length+" categories · "+files+" files · "+human(bytes);
+}
+function setRing(pct,sub){
+  $("#ring-pct").textContent=Math.round(pct*100)+"%";
+  $("#ring-sub").textContent=sub||"";
+  $("#ring-bar").style.strokeDashoffset=CIRC*(1-Math.min(1,Math.max(0,pct)));
+}
+async function doPack(){
+  const carbon=$("#carbon").checked;
+  const sel=carbon?[]:[...lastCat];
+  if(!carbon&&!sel.length){toast("Pick at least one category",true);return}
+  $("#pack-btn").disabled=true;
+  $("#send-progress").classList.remove("hidden");
+  $("#send-ready").classList.add("hidden");
+  $("#pack-console").innerHTML="";
+  let total=0,bytes=0;
+  try{
+    await sse("/api/pack",{carbon,select:sel},ev=>{
+      if(ev.event==="count"){total=ev.total;bytes=ev.bytes;setRing(0,"gathering")}
+      else if(ev.event==="file"){setRing(ev.done/total,"gathering");$("#pack-tick").textContent=ev.name;$("#pack-size").textContent=human(bytes)}
+      else if(ev.event==="phase"){setRing(1,"compressing");$("#pack-tick").textContent="squeezing it tight…"}
+      else if(ev.event==="log"){log("#pack-console",ev.line)}
+      else if(ev.event==="done"){
+        BUNDLE=ev.path;
+        setRing(1,"done");
+        $("#pack-console").innerHTML="";
+        log("#pack-console","✓ bundle written · "+human(ev.bytes)+" · "+ev.files+" files","ok");
+        $("#send-progress").classList.add("hidden");
+        $("#send-ready").classList.remove("hidden");
+        $("#bundle-path").textContent=ev.path;
+        $("#bundle-meta").textContent=human(ev.bytes)+" · "+ev.files+" files · "+(carbon?"carbon copy":"selective");
+        confetti();
+      }
+    });
+  }catch(e){toast("pack failed: "+e,true);log("#pack-console",String(e),"err")}
+  $("#pack-btn").disabled=false;
+}
+async function doServe(){
+  $("#serve-btn").textContent="starting…";
+  try{
+    const r=await api("/api/serve",{});
+    if(r.error){toast(r.error,true);return}
+    SERVING=true;
+    const url=(r.urls&&r.urls[0])||r.url;
+    $("#serve-url").value=url;
+    $("#serve-box").classList.remove("hidden");
+    $("#serve-btn").textContent="📡 sharing";
+  }catch(e){toast("serve failed: "+e,true)}
+}
+async function stopServe(){
+  await api("/api/stop",{});
+  SERVING=false;
+  $("#serve-box").classList.add("hidden");
+  $("#serve-btn").textContent="📡 share over LAN";
+}
+function copyPath(){navigator.clipboard.writeText($("#bundle-path").textContent).then(()=>toast("path copied"))}
+function copyUrl(){navigator.clipboard.writeText($("#serve-url").value).then(()=>toast("link copied — paste it on the new machine"))}
+
+/* ---------- RECEIVE ---------- */
+function startReceive(){
+  go("receive");
+  $("#recv-mani").classList.add("hidden");
+  $("#recv-apply").classList.add("hidden");
+  $("#recv-done").classList.add("hidden");
+  $("#recv-progress").classList.add("hidden");
+  $("#recv-input").classList.remove("hidden");
+}
+async function doLoad(){
+  const v=$("#recv-url").value.trim();
+  if(!v){toast("paste a link or path",true);return}
+  $("#load-btn").disabled=true;
+  $("#recv-input").classList.add("hidden");
+  $("#recv-progress").classList.remove("hidden");
+  $("#dl-console").innerHTML="";
+  const isUrl=/^https?:\/\//i.test(v);
+  try{
+    await sse("/api/load",isUrl?{url:v}:{path:v},ev=>{
+      if(ev.event==="download"){
+        const pct=ev.total?ev.done/ev.total:0;
+        $("#dl-pct").textContent=ev.total?Math.round(pct*100)+"%":human(ev.done);
+        $("#dl-tick").textContent=human(ev.done)+(ev.total?" / "+human(ev.total):"")+" received";
+      }else if(ev.event==="error"){
+        log("#dl-console",ev.line,"err");toast(ev.line,true);
+      }else if(ev.event==="ready"){
+        BUNDLE=ev.path;
+        renderManifest(ev.manifest);
+      }
+    });
+  }catch(e){toast("load failed: "+e,true)}
+  $("#load-btn").disabled=false;
+}
+function renderManifest(m){
+  $("#recv-progress").classList.add("hidden");
+  $("#recv-mani").classList.remove("hidden");
+  const om=m.omarchy||{};
+  let cats="";
+  Object.entries(m.categories||{}).forEach(([id,c])=>{
+    cats+=`<span class="chip">${c.label} · <b>${c.meta&&c.meta.count!=null?c.meta.count+" pkgs":c.files+" files"}</b></span>`;
+  });
+  const d=m.defaults||{};
+  $("#mani-box").innerHTML=`
+    <div class="mrow"><span class="k">from</span><span>${m.host} · ${m.user}</span></div>
+    <div class="mrow"><span class="k">omarchy</span><span>${om.version||"?"} (${om.channel||"?"})</span></div>
+    <div class="mrow"><span class="k">packed</span><span>${m.created||"?"} · mode: ${m.selection&&m.selection.mode||"?"}</span></div>
+    <div class="mrow"><span class="k">files</span><span>${(m.files||[]).length}</span></div>
+    <div class="mrow"><span class="k">packages</span><span>${(m.packages||[]).length}</span></div>
+    <div class="mrow"><span class="k">defaults</span><span class="mono" style="font-size:12.5px">term ${d.terminal||"?"} · ed ${d.editor||"?"} · br ${d.browser||"?"}${d.agent?" · ag "+d.agent:""}</span></div>
+    ${(m.themes||[]).length?`<div class="mrow" style="display:block"><span class="k">themes</span><div class="chips">${m.themes.map(t=>`<span class="chip">${t.name}</span>`).join("")}</div></div>`:""}
+    ${(m.plugins||[]).length?`<div class="mrow" style="display:block"><span class="k">plugins</span><div class="chips">${m.plugins.map(p=>`<span class="chip">${p.id}</span>`).join("")}</div></div>`:""}
+    <div class="mrow"><span class="k">categories</span><div class="chips">${cats}</div></div>`;
+}
+const STEPS=[["backup","Back up existing config"],["files","Copy your files"],["packages","Install packages"],["plugins","Clone plugins"],["themes","Install themes"],["defaults","Set defaults"],["restart","Restart shell"],["verify","Verify everything"]];
+function buildSteps(){
+  const list=$("#step-list");list.innerHTML="";
+  STEPS.forEach(([id,label])=>{
+    const s=el("div","step",`<div class="dot"></div><div><div class="st">${label}</div><div class="sd"></div></div>`);
+    s.dataset.id=id;list.appendChild(s);
+  });
+}
+function stepSet(id,status,detail){
+  const s=document.querySelector(`#step-list .step[data-id="${id}"]`);
+  if(!s)return;
+  s.classList.remove("run","done","err");
+  s.classList.add(status);
+  if(detail)s.querySelector(".sd").textContent=detail;
+  if(status!=="run")document.querySelectorAll("#step-list .step.run").forEach(x=>{if(x!==s)x.classList.remove("run")});
+}
+async function doApply(){
+  const dry=$("#dry").checked;
+  $("#apply-btn").disabled=true;
+  $("#recv-mani").classList.add("hidden");
+  $("#recv-apply").classList.remove("hidden");
+  $("#recv-done").classList.add("hidden");
+  $("#apply-console").innerHTML="";
+  buildSteps();
+  let ok=false;
+  try{
+    await sse("/api/apply",{bundle:BUNDLE,dry_run:dry},ev=>{
+      if(ev.event==="step"){
+        stepSet(ev.id,ev.status,ev.detail||"");
+        if(ev.status==="error")log("#apply-console",ev.label+": "+ev.detail,"err");
+      }else if(ev.event==="file"){
+        stepSet("files","run",`${ev.done}/${ev.total}`);
+      }else if(ev.event==="log"){
+        log("#apply-console",ev.line);
+        const m=ev.line.match(/^(back up|copy|packages|plugins|themes|defaults|restart|verify|install|cloning|setting|checking)/i);
+      }else if(ev.event==="manifest"){
+        /* manifest already shown */
+      }else if(ev.event==="done"){
+        ok=ev.ok;
+        log("#apply-console",ev.ok?"✓ apply finished":"apply finished with warnings",ev.ok?"ok":"err");
+        showDone(ev,dry);
+      }
+    });
+  }catch(e){toast("apply failed: "+e,true)}
+  $("#apply-btn").disabled=false;
+}
+async function showDone(ev,dry){
+  let rep=null;
+  if(!dry){
+    try{rep=await api("/api/verify",{bundle:BUNDLE})}catch(e){}
+  }
+  $("#recv-apply").classList.add("hidden");
+  $("#recv-done").classList.remove("hidden");
+  const t=$("#done-title"),s=$("#done-sub"),a=$("#done-actions");
+  a.innerHTML="";
+  if(dry){
+    t.textContent="Dry run complete";
+    s.textContent="Nothing was changed. Untick dry run and press apply to really move everything.";
+    a.appendChild(mkBtn("← back to bundle",()=>{$("#recv-done").classList.add("hidden");$("#recv-mani").classList.remove("hidden")}));
+    a.appendChild(mkBtn("⚡ apply for real",()=>doApply(),true));
+  }else if(rep){
+    if(rep.ok){
+      t.textContent="It's home 🎉";
+      s.textContent=`${rep.files_ok} files verified · ${rep.packages_total} packages all present. This machine now carries your setup.`;
+      confetti(big=true);
+      a.appendChild(mkBtn("🚀 restart shell to see it",async()=>{await api("/api/stop",{});toast("run: omarchy restart shell");}));
+      a.appendChild(mkBtn("🏠 home",()=>go("landing")));
+    }else{
+      t.textContent="Mostly there";
+      s.textContent=`${rep.files_ok} files ok, ${rep.files_missing} missing · ${rep.packages_missing.length} packages not found.`;
+      a.appendChild(mkBtn("🏠 home",()=>go("landing")));
+    }
+  }else{
+    t.textContent=ok?"Applied!":"Finished";
+    s.textContent=ok?"Your setup is in place.":"Apply finished — check the log for anything that needs a hand.";
+    a.appendChild(mkBtn("🏠 home",()=>go("landing")));
+  }
+}
+function mkBtn(label,fn,primary){
+  const b=el("button","btn"+(primary?" primary":""),label);
+  b.onclick=fn;return b;
+}
+
+/* ---------- AGENT ---------- */
+async function startAgent(){
+  toast("asking your default agent to take the wheel…");
+  try{
+    const r=await api("/api/agent",{});
+    if(r.error){toast(r.error,true);return}
+    toast("agent launched: "+r.agent);
+  }catch(e){toast("agent failed: "+e,true)}
+}
+
+/* ---------- PARTICLES ---------- */
+const bg=$("#bg"),bx=bg.getContext("2d");
+let P=[],W,H;
+function rs(){W=bg.width=innerWidth;H=bg.height=innerHeight}
+addEventListener("resize",rs);rs();
+for(let i=0;i<60;i++)P.push({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-.5)*.3,vy:(Math.random()-.5)*.3,r:Math.random()*1.6+.4});
+function getVar(n,f){const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim();return v||f}
+(function draw(){
+  bx.clearRect(0,0,W,H);
+  const col=getVar("--accent","#4aa3ff");
+  for(const p of P){
+    p.x+=p.vx;p.y+=p.vy;
+    if(p.x<0)p.x=W;if(p.x>W)p.x=0;if(p.y<0)p.y=H;if(p.y>H)p.y=0;
+    bx.beginPath();bx.arc(p.x,p.y,p.r,0,7);bx.fillStyle=col+"33";bx.fill();
+  }
+  for(let i=0;i<P.length;i++)for(let j=i+1;j<P.length;j++){
+    const a=P[i],b=P[j],dx=a.x-b.x,dy=a.y-b.y,d=dx*dx+dy*dy;
+    if(d<110*110){
+      bx.beginPath();bx.moveTo(a.x,a.y);bx.lineTo(b.x,b.y);
+      bx.strokeStyle=col+(Math.floor((1-d/(110*110))*40).toString(16).padStart(2,"0"));bx.stroke();
+    }
+  }
+  requestAnimationFrame(draw);
+})();
+
+/* ---------- CONFETTI ---------- */
+const cf=$("#confetti"),cx=cf.getContext("2d");
+let CF=[],cfRun=false;
+function rs2(){cf.width=innerWidth;cf.height=innerHeight}
+addEventListener("resize",rs2);rs2();
+function confetti(big){
+  const cols=["--accent","--cyan","--magenta","--green","--yellow"].map(n=>getVar(n,"#fff"));
+  const n=big?260:120;
+  for(let i=0;i<n;i++){
+    CF.push({x:innerWidth/2+(Math.random()-.5)*innerWidth*.5,y:innerHeight*.35,
+      vx:(Math.random()-.5)*14,vy:Math.random()*-14-4,g:.42,s:Math.random()*8+4,
+      c:cols[i%cols.length],r:Math.random()*Math.PI,vr:(Math.random()-.5)*.3,life:1});
+  }
+  if(!cfRun){cfRun=true;loop()}
+}
+function loop(){
+  cx.clearRect(0,0,cf.width,cf.height);
+  CF=CF.filter(p=>p.life>0);
+  for(const p of CF){
+    p.vy+=p.g;p.x+=p.vx;p.y+=p.vy;p.vx*=.99;p.r+=p.vr;p.life-=.006;
+    cx.save();cx.translate(p.x,p.y);cx.rotate(p.r);cx.globalAlpha=Math.max(0,p.life);
+    cx.fillStyle=p.c;cx.fillRect(-p.s/2,-p.s/2,p.s,p.s*.6);cx.restore();
+  }
+  if(CF.length){requestAnimationFrame(loop)}else{cfRun=false;cx.clearRect(0,0,cf.width,cf.height)}
+}
+</script>
+</body>
+</html>
+"""
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="omamigrate",
+                                 description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("gui", help="open the dashboard")
+    p.add_argument("--port", type=int, default=0)
+
+    p = sub.add_parser("scan", help="inventory this machine")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--events", action="store_true")
+
+    p = sub.add_parser("pack", help="build a bundle")
+    p.add_argument("--out", default=None)
+    p.add_argument("--all", action="store_true", help="carbon copy (everything)")
+    p.add_argument("--select", default=None, help="comma-separated category ids")
+    p.add_argument("--events", action="store_true")
+
+    p = sub.add_parser("serve", help="serve the newest bundle over the LAN")
+    p.add_argument("--bundle", default=None)
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--events", action="store_true")
+
+    p = sub.add_parser("unpack", help="inspect a bundle")
+    p.add_argument("bundle")
+
+    p = sub.add_parser("apply", help="restore a bundle on this machine")
+    p.add_argument("bundle")
+    p.add_argument("--select", default=None)
+    p.add_argument("--exclude", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--events", action="store_true")
+
+    p = sub.add_parser("verify", help="verify a bundle was restored")
+    p.add_argument("bundle")
+    p.add_argument("--events", action="store_true")
+
+    p = sub.add_parser("agent", help="let your default agent walk you through it")
+    p.add_argument("--new-window", action="store_true")
+    p.add_argument("--prompt-only", action="store_true")
+
+    p = sub.add_parser("install-menu", help="add the Omarchy menu entry")
+
+    args = ap.parse_args(argv)
+
+    if args.cmd is None:
+        args = ap.parse_args(["gui"])
+
+    if args.cmd == "gui":
+        return cmd_gui(args)
+    if args.cmd == "scan":
+        inv = build_inventory()
+        if args.json or args.events:
+            print(json.dumps(inv, indent=2))
+        else:
+            print(f"Omamigrate — inventory for {inv['host']} "
+                  f"(omarchy {inv['omarchy'] or 'n/a'})\n")
+            for c in inv["categories"]:
+                flag = " (opt-in)" if c["optin"] else ""
+                if c["id"] == "packages":
+                    print(f"  {c['icon']} {c['label']:<22} "
+                          f"{c['meta'].get('count', 0):>9} packages{flag}")
+                    continue
+                print(f"  {c['icon']} {c['label']:<22} {human(c['bytes']):>9} "
+                      f"{c['files']:>6} files{flag}")
+                for it in c["items"][:8]:
+                    print(f"      - {it['label']}  ({human(it['bytes'])})")
+                if len(c["items"]) > 8:
+                    print(f"      … and {len(c['items']) - 8} more")
+        return 0
+    if args.cmd == "pack":
+        return cmd_pack(args)
+    if args.cmd == "serve":
+        return cmd_serve(args)
+    if args.cmd == "unpack":
+        return cmd_unpack(args)
+    if args.cmd == "apply":
+        return cmd_apply(args)
+    if args.cmd == "verify":
+        return cmd_verify(args)
+    if args.cmd == "agent":
+        return cmd_agent(args)
+    if args.cmd == "install-menu":
+        return cmd_install_menu(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Omamigrate
+Comment=Move your Omarchy to a new machine
+Exec=omamigrate
+Icon=applications-system
+Terminal=false
+Categories=System;Utility;

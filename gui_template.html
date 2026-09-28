@@ -1,0 +1,678 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>omamigrate · __HOST__</title>
+<style>
+/*__THEME__*/
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --panel:color-mix(in srgb, var(--bg2) 78%, transparent);
+  --line:color-mix(in srgb, var(--fg) 14%, transparent);
+  --glow:color-mix(in srgb, var(--accent) 45%, transparent);
+}
+html,body{height:100%}
+body{
+  font:15px/1.5 ui-sans-serif,system-ui,"Segoe UI",sans-serif;
+  background:var(--bg);color:var(--fg);overflow-x:hidden;
+}
+#bg{position:fixed;inset:0;z-index:0}
+#confetti{position:fixed;inset:0;z-index:60;pointer-events:none}
+.wrap{position:relative;z-index:1;max-width:1060px;margin:0 auto;padding:28px 22px 80px}
+/* top bar */
+.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:26px}
+.wordmark{
+  font-weight:800;font-size:22px;letter-spacing:-.5px;cursor:pointer;
+  background:linear-gradient(90deg,var(--accent),var(--cyan),var(--magenta),var(--accent));
+  background-size:300% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;
+  animation:flow 6s linear infinite;
+}
+@keyframes flow{to{background-position:300% 0}}
+.ver{color:var(--muted);font-size:12.5px;font-family:ui-monospace,monospace}
+/* views */
+.view{display:none;animation:rise .45s cubic-bezier(.2,.8,.2,1) both}
+.view.on{display:block}
+@keyframes rise{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}
+/* landing */
+.hero{text-align:center;margin:9vh 0 34px}
+.hero h1{
+  font-size:40px;font-weight:800;letter-spacing:-1px;
+  background:linear-gradient(90deg,var(--accent),var(--cyan),var(--magenta),var(--accent));
+  background-size:300% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;
+  animation:flow 6s linear infinite;
+}
+.hero p{color:var(--muted);margin-top:10px;max-width:520px;margin-inline:auto}
+.duo{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+@media(max-width:720px){.duo{grid-template-columns:1fr}}
+.bigcard{
+  position:relative;border:1px solid var(--line);border-radius:20px;padding:30px 26px;
+  background:var(--panel);cursor:pointer;overflow:hidden;
+  transition:transform .25s,border-color .25s,box-shadow .25s;
+}
+.bigcard:hover{transform:translateY(-4px);border-color:var(--accent);box-shadow:0 18px 50px -18px var(--glow)}
+.bigcard .em{font-size:38px}
+.bigcard h3{font-size:20px;margin:12px 0 6px}
+.bigcard p{color:var(--muted);font-size:14px}
+.bigcard .arrow{position:absolute;right:22px;top:26px;font-size:22px;color:var(--muted);transition:.25s}
+.bigcard:hover .arrow{color:var(--accent);transform:translateX(5px)}
+.agentline{margin-top:18px;text-align:center}
+/* buttons */
+.btn{
+  border:1px solid var(--line);background:var(--bg2);color:var(--fg);
+  padding:10px 18px;border-radius:11px;font-size:14px;font-weight:600;cursor:pointer;
+  transition:.2s;
+}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;box-shadow:0 8px 26px -10px var(--glow)}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost{background:transparent}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.danger{border-color:var(--red);color:var(--red)}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.spread{justify-content:space-between}
+/* section heads */
+.shead{display:flex;align-items:center;gap:12px;margin:26px 0 14px}
+.shead h2{font-size:17px}
+.shead .sub{color:var(--muted);font-size:13px}
+/* carbon switch */
+.switch{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.switch input{display:none}
+.track{width:46px;height:26px;border-radius:20px;background:var(--bg2);border:1px solid var(--line);position:relative;transition:.25s}
+.thumb{position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:var(--muted);transition:.25s cubic-bezier(.3,1.4,.5,1)}
+.switch input:checked + .track{background:var(--accent);border-color:var(--accent)}
+.switch input:checked + .track .thumb{left:22px;background:#fff}
+.swlabel{font-weight:600;font-size:14px}
+/* category grid */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:12px}
+.card{
+  border:1px solid var(--line);border-radius:14px;padding:14px;background:var(--panel);
+  cursor:pointer;position:relative;transition:.2s;opacity:0;animation:pop .4s both;
+}
+@keyframes pop{from{opacity:0;transform:scale(.94) translateY(8px)}to{opacity:1;transform:none}}
+.card:hover{border-color:color-mix(in srgb,var(--accent) 55%,transparent);transform:translateY(-2px)}
+.card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+.card .ic{font-size:22px}
+.card h4{font-size:14.5px;margin:8px 0 2px}
+.card .meta{color:var(--muted);font-size:12px;font-family:ui-monospace,monospace}
+.card .badge{position:absolute;top:12px;right:12px;font-size:10.5px;color:var(--yellow);border:1px solid var(--yellow);border-radius:20px;padding:1px 8px}
+.card .tick{position:absolute;bottom:12px;right:12px;width:20px;height:20px;border-radius:6px;border:1.5px solid var(--line);display:grid;place-items:center;font-size:13px;color:#fff;transition:.2s}
+.card.sel .tick{background:var(--accent);border-color:var(--accent)}
+.card .items{margin-top:8px;display:none;max-height:150px;overflow:auto;border-top:1px solid var(--line);padding-top:8px}
+.card.open .items{display:block}
+.card .items div{font-size:12px;color:var(--muted);padding:2px 0;font-family:ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* progress */
+.pbox{border:1px solid var(--line);border-radius:16px;padding:26px;background:var(--panel);text-align:center}
+.ring{width:150px;height:150px;margin:0 auto 8px;position:relative}
+.ring svg{transform:rotate(-90deg)}
+.ring .track{fill:none;stroke:var(--bg2);stroke-width:12}
+.ring .bar{fill:none;stroke:var(--accent);stroke-width:12;stroke-linecap:round;transition:stroke-dashoffset .35s;filter:drop-shadow(0 0 6px var(--glow))}
+.ring .num{position:absolute;inset:0;display:grid;place-items:center;font-size:26px;font-weight:800}
+.ring .num small{display:block;font-size:11px;color:var(--muted);font-weight:500;text-align:center}
+.ticker{font-family:ui-monospace,monospace;font-size:12.5px;color:var(--muted);margin-top:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bignum{font-size:15px;font-weight:700;margin-top:6px}
+/* console */
+.console{
+  margin-top:14px;background:color-mix(in srgb,black 30%,var(--bg));border:1px solid var(--line);
+  border-radius:12px;padding:12px;height:170px;overflow:auto;font-family:ui-monospace,monospace;
+  font-size:12px;text-align:left;
+}
+.console .ln{white-space:pre-wrap;word-break:break-all;color:color-mix(in srgb,var(--fg) 82%,transparent);animation:lnin .25s both}
+@keyframes lnin{from{opacity:0;transform:translateX(-6px)}to{opacity:1;transform:none}}
+.console .ln.err{color:var(--red)}
+.console .ln.ok{color:var(--green)}
+/* bundle ready */
+.bundle{
+  border:1px solid var(--green);border-radius:16px;padding:22px;background:var(--panel);
+  box-shadow:0 0 40px -18px var(--green);
+}
+.bundle .path{font-family:ui-monospace,monospace;font-size:13px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px 12px;word-break:break-all;margin:10px 0}
+.urlbox{display:flex;gap:8px;margin-top:12px}
+.urlbox input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:9px;padding:10px 12px;font-family:ui-monospace,monospace;font-size:13px}
+/* receive input */
+.recin{display:flex;gap:10px;margin-top:14px}
+.recin input{flex:1;background:var(--bg);border:1px solid var(--line);color:var(--fg);border-radius:11px;padding:13px 14px;font-family:ui-monospace,monospace;font-size:13.5px}
+.recin input:focus{outline:none;border-color:var(--accent)}
+/* manifest */
+.mani{border:1px solid var(--line);border-radius:16px;padding:20px;background:var(--panel);margin-top:16px}
+.mani .mrow{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}
+.mani .mrow:last-child{border:0}
+.mani .k{color:var(--muted)}
+.chips{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}
+.chip{font-size:12px;border:1px solid var(--line);border-radius:20px;padding:3px 11px;color:var(--fg);background:var(--bg)}
+.chip b{color:var(--accent)}
+/* steps timeline */
+.steps{margin-top:16px;border:1px solid var(--line);border-radius:16px;padding:20px;background:var(--panel)}
+.step{display:flex;gap:14px;align-items:flex-start;padding:11px 0;position:relative}
+.step:not(:last-child)::before{content:"";position:absolute;left:15px;top:40px;bottom:-4px;width:2px;background:var(--line)}
+.step .dot{
+  width:32px;height:32px;border-radius:50%;border:2px solid var(--line);display:grid;place-items:center;
+  font-size:14px;flex:none;background:var(--bg);transition:.3s;
+}
+.step .st{font-weight:600;font-size:14.5px;padding-top:2px}
+.step .sd{color:var(--muted);font-size:12.5px;font-family:ui-monospace,monospace}
+.step.run .dot{border-color:var(--accent);box-shadow:0 0 0 0 var(--glow);animation:pulse 1.2s infinite}
+.step.run .dot::after{content:"";width:12px;height:12px;border-radius:50%;background:var(--accent);animation:spin 1s linear infinite;border:2px solid transparent;border-top-color:#fff}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes pulse{0%{box-shadow:0 0 0 0 var(--glow)}70%{box-shadow:0 0 0 10px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.step.done .dot{background:var(--green);border-color:var(--green);color:#fff;animation:pop .35s}
+.step.done .dot::after{content:"✓"}
+.step.err .dot{background:var(--red);border-color:var(--red);color:#fff;animation:pop .35s}
+.step.err .dot::after{content:"✕"}
+.step.err .st{color:var(--red)}
+/* done */
+.done{
+  text-align:center;border:1px solid var(--green);border-radius:18px;padding:38px;background:var(--panel);
+  box-shadow:0 0 60px -20px var(--green);animation:pop .5s both;
+}
+.done .big{font-size:52px}
+.done h2{font-size:24px;margin:12px 0 6px}
+.done p{color:var(--muted)}
+/* toast */
+#toast{
+  position:fixed;bottom:26px;left:50%;transform:translateX(-50%) translateY(20px);
+  background:var(--bg2);border:1px solid var(--line);border-radius:12px;padding:11px 20px;
+  font-size:14px;opacity:0;pointer-events:none;transition:.3s;z-index:70;box-shadow:0 10px 40px -10px #000;
+}
+#toast.on{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.err{border-color:var(--red);color:var(--red)}
+/* misc */
+.muted{color:var(--muted)}
+.mono{font-family:ui-monospace,monospace}
+.center{text-align:center}
+.mt{margin-top:16px}
+.hidden{display:none!important}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--muted);border-top-color:var(--fg);border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<canvas id="confetti"></canvas>
+<div class="wrap">
+  <div class="top">
+    <div class="wordmark" onclick="go('landing')">⌘ omamigrate</div>
+    <div class="ver">v__VERSION__ · __HOST__</div>
+  </div>
+
+  <!-- LANDING -->
+  <section class="view on" id="v-landing">
+    <div class="hero">
+      <h1>Move your omarchy</h1>
+      <p>Every theme, plugin, keybinding and package you have shaped — carried from one machine to the next. Nothing left behind.</p>
+    </div>
+    <div class="duo">
+      <div class="bigcard" onclick="startSend()">
+        <div class="arrow">→</div>
+        <div class="em">📤</div>
+        <h3>Send from here</h3>
+        <p>Pack this machine's customizations into a portable bundle and share it over the network.</p>
+      </div>
+      <div class="bigcard" onclick="startReceive()">
+        <div class="arrow">→</div>
+        <div class="em">📥</div>
+        <h3>Receive here</h3>
+        <p>Drop in a bundle from your old machine and watch this one become it — step by step.</p>
+      </div>
+    </div>
+    <div class="agentline">
+      <button class="btn ghost" onclick="startAgent()">🤖 Let the agent walk me through it</button>
+    </div>
+  </section>
+
+  <!-- SEND -->
+  <section class="view" id="v-send">
+    <div class="shead spread">
+      <div><h2>What to take</h2><span class="sub" id="send-sub"></span></div>
+      <label class="switch" title="Grab everything, including opt-in extras">
+        <input type="checkbox" id="carbon" onchange="carbonToggle()">
+        <span class="track"><span class="thumb"></span></span>
+        <span class="swlabel">Carbon copy</span>
+      </label>
+    </div>
+    <div class="grid" id="cat-grid"></div>
+    <div class="row mt spread">
+      <button class="btn ghost" onclick="go('landing')">← back</button>
+      <div class="row">
+        <span class="muted" id="sel-sum"></span>
+        <button class="btn primary" id="pack-btn" onclick="doPack()">Pack it up →</button>
+      </div>
+    </div>
+
+    <!-- packing progress -->
+    <div class="hidden mt" id="send-progress">
+      <div class="pbox">
+        <div class="ring">
+          <svg width="150" height="150"><circle class="track" cx="75" cy="75" r="66"/><circle class="bar" id="ring-bar" cx="75" cy="75" r="66"/></svg>
+          <div class="num"><div><span id="ring-pct">0%</span><small id="ring-sub">gathering</small></div></div>
+        </div>
+        <div class="bignum" id="pack-size">0 B</div>
+        <div class="ticker" id="pack-tick">warming up…</div>
+        <div class="console" id="pack-console"></div>
+      </div>
+    </div>
+
+    <!-- bundle ready -->
+    <div class="hidden mt" id="send-ready">
+      <div class="bundle">
+        <div class="center" style="font-size:40px">📦</div>
+        <h3 class="center" style="margin-top:8px">Bundle ready</h3>
+        <p class="center muted" id="bundle-meta"></p>
+        <div class="path" id="bundle-path"></div>
+        <div class="row spread center">
+          <button class="btn" onclick="copyPath()">⧉ copy path</button>
+          <button class="btn primary" id="serve-btn" onclick="doServe()">📡 share over LAN</button>
+        </div>
+        <div class="hidden" id="serve-box">
+          <div class="urlbox">
+            <input id="serve-url" readonly>
+            <button class="btn" onclick="copyUrl()">copy</button>
+            <button class="btn danger" onclick="stopServe()">stop</button>
+          </div>
+          <p class="muted center mt" style="font-size:12.5px">Open this on the new machine, or paste it into "Receive here" there.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RECEIVE -->
+  <section class="view" id="v-receive">
+    <div class="shead spread">
+      <div><h2>Where from?</h2><span class="sub">A share link from your old machine, or a bundle file on disk.</span></div>
+      <button class="btn ghost" onclick="go('landing')">← back</button>
+    </div>
+    <div id="recv-input">
+      <div class="recin">
+        <input id="recv-url" placeholder="http://old-machine:PORT/?token=…   or   /path/to/bundle.tar.zst">
+        <button class="btn primary" id="load-btn" onclick="doLoad()">Load bundle →</button>
+      </div>
+    </div>
+
+    <div class="hidden mt" id="recv-progress">
+      <div class="pbox">
+        <div class="bignum" id="dl-pct">0%</div>
+        <div class="ticker" id="dl-tick">downloading…</div>
+        <div class="console" id="dl-console"></div>
+      </div>
+    </div>
+
+    <div class="hidden" id="recv-mani">
+      <div class="mani" id="mani-box"></div>
+      <div class="row mt spread">
+        <label class="switch"><input type="checkbox" id="dry"><span class="track"><span class="thumb"></span></span><span class="swlabel" style="font-size:13px">Dry run (preview, change nothing)</span></label>
+        <button class="btn primary" id="apply-btn" onclick="doApply()">⚡ Apply to this machine</button>
+      </div>
+    </div>
+
+    <div class="hidden mt" id="recv-apply">
+      <div class="steps" id="step-list"></div>
+      <div class="console mt" id="apply-console"></div>
+    </div>
+
+    <div class="hidden mt" id="recv-done">
+      <div class="done">
+        <div class="big">🎉</div>
+        <h2 id="done-title">All set</h2>
+        <p id="done-sub"></p>
+        <div class="row center mt" id="done-actions"></div>
+      </div>
+    </div>
+  </section>
+</div>
+<div id="toast"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const CIRC=2*Math.PI*66;
+let INV=null, BUNDLE=null, SERVING=false, lastCat=new Set(), agentDone=false;
+$("#ring-bar").style.strokeDasharray=CIRC;
+$("#ring-bar").style.strokeDashoffset=CIRC;
+
+function toast(msg,err){
+  const t=$("#toast");t.textContent=msg;t.className=err?"on err":"on";
+  clearTimeout(t._t);t._t=setTimeout(()=>t.className="",2600);
+}
+function human(b){
+  if(b==null)return"0 B";
+  const u=["B","KB","MB","GB","TB"];let i=0;
+  while(b>=1024&&i<u.length-1){b/=1024;i++}
+  return b.toFixed(b<10&&i>0?1:0)+" "+u[i];
+}
+function el(tag,cls,html){const e=document.createElement(tag);if(cls)e.className=cls;if(html!=null)e.innerHTML=html;return e}
+function log(box,line,cls){
+  const c=$(box);const l=el("div","ln"+(cls?" "+cls:""),line);c.appendChild(l);
+  while(c.children.length>400)c.removeChild(c.firstChild);c.scrollTop=c.scrollHeight;
+}
+async function api(path,body){
+  const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+  return r.json();
+}
+async function sse(path,body,onEv){
+  const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+  const rd=r.body.getReader();const dec=new TextDecoder();let buf="";
+  while(true){
+    const {done,value}=await rd.read();
+    if(done)break;
+    buf+=dec.decode(value,{stream:true});
+    let i;
+    while((i=buf.indexOf("\n\n"))>=0){
+      const chunk=buf.slice(0,i);buf=buf.slice(i+2);
+      for(const line of chunk.split("\n")){
+        if(line.startsWith("data: ")){try{onEv(JSON.parse(line.slice(6)))}catch(e){}}
+      }
+    }
+  }
+}
+function go(v){
+  document.querySelectorAll(".view").forEach(x=>x.classList.remove("on"));
+  $("#v-"+v).classList.add("on");window.scrollTo({top:0,behavior:"smooth"});
+}
+
+/* ---------- SEND ---------- */
+async function startSend(){
+  go("send");
+  $("#send-sub").innerHTML='<span class="spin"></span> scanning this machine…';
+  $("#cat-grid").innerHTML="";
+  try{
+    INV=await api("/api/scan",{});
+  }catch(e){$("#send-sub").textContent="scan failed: "+e;return}
+  $("#send-sub").textContent=`${INV.host} · omarchy ${INV.omarchy||"?"} · ${INV.user}`;
+  renderCats();
+}
+function renderCats(){
+  const g=$("#cat-grid");g.innerHTML="";
+  lastCat=new Set();
+  INV.categories.forEach((c,i)=>{
+    if(!c.items.length&&!c.meta)return;
+    const card=el("div","card");
+    card.style.animationDelay=(i*45)+"ms";
+    card.innerHTML=`<div class="ic">${c.icon}</div><h4>${c.label}</h4>
+      <div class="meta">${c.meta&&c.meta.count!=null?c.meta.count+" packages":c.files+" files · "+human(c.bytes)}</div>
+      ${c.optin?'<span class="badge">opt-in</span>':""}
+      <div class="tick">✓</div><div class="items"></div>`;
+    const itemsBox=card.querySelector(".items");
+    c.items.slice(0,60).forEach(function(it){
+      var label=it.label;
+      if(it.files>1){label=label+" ("+it.files+")";}
+      itemsBox.appendChild(el("div",null,label));
+    });
+    if(c.items.length>60)itemsBox.appendChild(el("div",null,"… and "+(c.items.length-60)+" more"));
+    card.onclick=e=>{
+      if($("#carbon").checked)return;
+      card.classList.toggle("sel");
+      if(card.classList.contains("sel"))lastCat.add(c.id);else lastCat.delete(c.id);
+      updateSelSum();
+      e.stopPropagation();
+    };
+    g.appendChild(card);
+  });
+  updateSelSum();
+}
+function carbonToggle(){
+  const on=$("#carbon").checked;
+  document.querySelectorAll("#cat-grid .card").forEach(c=>c.classList.toggle("sel",on));
+  if(on)lastCat=new Set(INV.categories.map(c=>c.id));else lastCat.clear();
+  updateSelSum();
+}
+function updateSelSum(){
+  let files=0,bytes=0,n=0;
+  INV.categories.forEach(c=>{
+    const on=$("#carbon").checked||lastCat.has(c.id);
+    if(on){files+=c.files;bytes+=c.bytes;n++}
+  });
+  $("#sel-sum").textContent=n+" of "+INV.categories.length+" categories · "+files+" files · "+human(bytes);
+}
+function setRing(pct,sub){
+  $("#ring-pct").textContent=Math.round(pct*100)+"%";
+  $("#ring-sub").textContent=sub||"";
+  $("#ring-bar").style.strokeDashoffset=CIRC*(1-Math.min(1,Math.max(0,pct)));
+}
+async function doPack(){
+  const carbon=$("#carbon").checked;
+  const sel=carbon?[]:[...lastCat];
+  if(!carbon&&!sel.length){toast("Pick at least one category",true);return}
+  $("#pack-btn").disabled=true;
+  $("#send-progress").classList.remove("hidden");
+  $("#send-ready").classList.add("hidden");
+  $("#pack-console").innerHTML="";
+  let total=0,bytes=0;
+  try{
+    await sse("/api/pack",{carbon,select:sel},ev=>{
+      if(ev.event==="count"){total=ev.total;bytes=ev.bytes;setRing(0,"gathering")}
+      else if(ev.event==="file"){setRing(ev.done/total,"gathering");$("#pack-tick").textContent=ev.name;$("#pack-size").textContent=human(bytes)}
+      else if(ev.event==="phase"){setRing(1,"compressing");$("#pack-tick").textContent="squeezing it tight…"}
+      else if(ev.event==="log"){log("#pack-console",ev.line)}
+      else if(ev.event==="done"){
+        BUNDLE=ev.path;
+        setRing(1,"done");
+        $("#pack-console").innerHTML="";
+        log("#pack-console","✓ bundle written · "+human(ev.bytes)+" · "+ev.files+" files","ok");
+        $("#send-progress").classList.add("hidden");
+        $("#send-ready").classList.remove("hidden");
+        $("#bundle-path").textContent=ev.path;
+        $("#bundle-meta").textContent=human(ev.bytes)+" · "+ev.files+" files · "+(carbon?"carbon copy":"selective");
+        confetti();
+      }
+    });
+  }catch(e){toast("pack failed: "+e,true);log("#pack-console",String(e),"err")}
+  $("#pack-btn").disabled=false;
+}
+async function doServe(){
+  $("#serve-btn").textContent="starting…";
+  try{
+    const r=await api("/api/serve",{});
+    if(r.error){toast(r.error,true);return}
+    SERVING=true;
+    const url=(r.urls&&r.urls[0])||r.url;
+    $("#serve-url").value=url;
+    $("#serve-box").classList.remove("hidden");
+    $("#serve-btn").textContent="📡 sharing";
+  }catch(e){toast("serve failed: "+e,true)}
+}
+async function stopServe(){
+  await api("/api/stop",{});
+  SERVING=false;
+  $("#serve-box").classList.add("hidden");
+  $("#serve-btn").textContent="📡 share over LAN";
+}
+function copyPath(){navigator.clipboard.writeText($("#bundle-path").textContent).then(()=>toast("path copied"))}
+function copyUrl(){navigator.clipboard.writeText($("#serve-url").value).then(()=>toast("link copied — paste it on the new machine"))}
+
+/* ---------- RECEIVE ---------- */
+function startReceive(){
+  go("receive");
+  $("#recv-mani").classList.add("hidden");
+  $("#recv-apply").classList.add("hidden");
+  $("#recv-done").classList.add("hidden");
+  $("#recv-progress").classList.add("hidden");
+  $("#recv-input").classList.remove("hidden");
+}
+async function doLoad(){
+  const v=$("#recv-url").value.trim();
+  if(!v){toast("paste a link or path",true);return}
+  $("#load-btn").disabled=true;
+  $("#recv-input").classList.add("hidden");
+  $("#recv-progress").classList.remove("hidden");
+  $("#dl-console").innerHTML="";
+  const isUrl=/^https?:\/\//i.test(v);
+  try{
+    await sse("/api/load",isUrl?{url:v}:{path:v},ev=>{
+      if(ev.event==="download"){
+        const pct=ev.total?ev.done/ev.total:0;
+        $("#dl-pct").textContent=ev.total?Math.round(pct*100)+"%":human(ev.done);
+        $("#dl-tick").textContent=human(ev.done)+(ev.total?" / "+human(ev.total):"")+" received";
+      }else if(ev.event==="error"){
+        log("#dl-console",ev.line,"err");toast(ev.line,true);
+      }else if(ev.event==="ready"){
+        BUNDLE=ev.path;
+        renderManifest(ev.manifest);
+      }
+    });
+  }catch(e){toast("load failed: "+e,true)}
+  $("#load-btn").disabled=false;
+}
+function renderManifest(m){
+  $("#recv-progress").classList.add("hidden");
+  $("#recv-mani").classList.remove("hidden");
+  const om=m.omarchy||{};
+  let cats="";
+  Object.entries(m.categories||{}).forEach(([id,c])=>{
+    cats+=`<span class="chip">${c.label} · <b>${c.meta&&c.meta.count!=null?c.meta.count+" pkgs":c.files+" files"}</b></span>`;
+  });
+  const d=m.defaults||{};
+  $("#mani-box").innerHTML=`
+    <div class="mrow"><span class="k">from</span><span>${m.host} · ${m.user}</span></div>
+    <div class="mrow"><span class="k">omarchy</span><span>${om.version||"?"} (${om.channel||"?"})</span></div>
+    <div class="mrow"><span class="k">packed</span><span>${m.created||"?"} · mode: ${m.selection&&m.selection.mode||"?"}</span></div>
+    <div class="mrow"><span class="k">files</span><span>${(m.files||[]).length}</span></div>
+    <div class="mrow"><span class="k">packages</span><span>${(m.packages||[]).length}</span></div>
+    <div class="mrow"><span class="k">defaults</span><span class="mono" style="font-size:12.5px">term ${d.terminal||"?"} · ed ${d.editor||"?"} · br ${d.browser||"?"}${d.agent?" · ag "+d.agent:""}</span></div>
+    ${(m.themes||[]).length?`<div class="mrow" style="display:block"><span class="k">themes</span><div class="chips">${m.themes.map(t=>`<span class="chip">${t.name}</span>`).join("")}</div></div>`:""}
+    ${(m.plugins||[]).length?`<div class="mrow" style="display:block"><span class="k">plugins</span><div class="chips">${m.plugins.map(p=>`<span class="chip">${p.id}</span>`).join("")}</div></div>`:""}
+    <div class="mrow"><span class="k">categories</span><div class="chips">${cats}</div></div>`;
+}
+const STEPS=[["backup","Back up existing config"],["files","Copy your files"],["packages","Install packages"],["plugins","Clone plugins"],["themes","Install themes"],["defaults","Set defaults"],["restart","Restart shell"],["verify","Verify everything"]];
+function buildSteps(){
+  const list=$("#step-list");list.innerHTML="";
+  STEPS.forEach(([id,label])=>{
+    const s=el("div","step",`<div class="dot"></div><div><div class="st">${label}</div><div class="sd"></div></div>`);
+    s.dataset.id=id;list.appendChild(s);
+  });
+}
+function stepSet(id,status,detail){
+  const s=document.querySelector(`#step-list .step[data-id="${id}"]`);
+  if(!s)return;
+  s.classList.remove("run","done","err");
+  s.classList.add(status);
+  if(detail)s.querySelector(".sd").textContent=detail;
+  if(status!=="run")document.querySelectorAll("#step-list .step.run").forEach(x=>{if(x!==s)x.classList.remove("run")});
+}
+async function doApply(){
+  const dry=$("#dry").checked;
+  $("#apply-btn").disabled=true;
+  $("#recv-mani").classList.add("hidden");
+  $("#recv-apply").classList.remove("hidden");
+  $("#recv-done").classList.add("hidden");
+  $("#apply-console").innerHTML="";
+  buildSteps();
+  let ok=false;
+  try{
+    await sse("/api/apply",{bundle:BUNDLE,dry_run:dry},ev=>{
+      if(ev.event==="step"){
+        stepSet(ev.id,ev.status,ev.detail||"");
+        if(ev.status==="error")log("#apply-console",ev.label+": "+ev.detail,"err");
+      }else if(ev.event==="file"){
+        stepSet("files","run",`${ev.done}/${ev.total}`);
+      }else if(ev.event==="log"){
+        log("#apply-console",ev.line);
+        const m=ev.line.match(/^(back up|copy|packages|plugins|themes|defaults|restart|verify|install|cloning|setting|checking)/i);
+      }else if(ev.event==="manifest"){
+        /* manifest already shown */
+      }else if(ev.event==="done"){
+        ok=ev.ok;
+        log("#apply-console",ev.ok?"✓ apply finished":"apply finished with warnings",ev.ok?"ok":"err");
+        showDone(ev,dry);
+      }
+    });
+  }catch(e){toast("apply failed: "+e,true)}
+  $("#apply-btn").disabled=false;
+}
+async function showDone(ev,dry){
+  let rep=null;
+  if(!dry){
+    try{rep=await api("/api/verify",{bundle:BUNDLE})}catch(e){}
+  }
+  $("#recv-apply").classList.add("hidden");
+  $("#recv-done").classList.remove("hidden");
+  const t=$("#done-title"),s=$("#done-sub"),a=$("#done-actions");
+  a.innerHTML="";
+  if(dry){
+    t.textContent="Dry run complete";
+    s.textContent="Nothing was changed. Untick dry run and press apply to really move everything.";
+    a.appendChild(mkBtn("← back to bundle",()=>{$("#recv-done").classList.add("hidden");$("#recv-mani").classList.remove("hidden")}));
+    a.appendChild(mkBtn("⚡ apply for real",()=>doApply(),true));
+  }else if(rep){
+    if(rep.ok){
+      t.textContent="It's home 🎉";
+      s.textContent=`${rep.files_ok} files verified · ${rep.packages_total} packages all present. This machine now carries your setup.`;
+      confetti(big=true);
+      a.appendChild(mkBtn("🚀 restart shell to see it",async()=>{await api("/api/stop",{});toast("run: omarchy restart shell");}));
+      a.appendChild(mkBtn("🏠 home",()=>go("landing")));
+    }else{
+      t.textContent="Mostly there";
+      s.textContent=`${rep.files_ok} files ok, ${rep.files_missing} missing · ${rep.packages_missing.length} packages not found.`;
+      a.appendChild(mkBtn("🏠 home",()=>go("landing")));
+    }
+  }else{
+    t.textContent=ok?"Applied!":"Finished";
+    s.textContent=ok?"Your setup is in place.":"Apply finished — check the log for anything that needs a hand.";
+    a.appendChild(mkBtn("🏠 home",()=>go("landing")));
+  }
+}
+function mkBtn(label,fn,primary){
+  const b=el("button","btn"+(primary?" primary":""),label);
+  b.onclick=fn;return b;
+}
+
+/* ---------- AGENT ---------- */
+async function startAgent(){
+  toast("asking your default agent to take the wheel…");
+  try{
+    const r=await api("/api/agent",{});
+    if(r.error){toast(r.error,true);return}
+    toast("agent launched: "+r.agent);
+  }catch(e){toast("agent failed: "+e,true)}
+}
+
+/* ---------- PARTICLES ---------- */
+const bg=$("#bg"),bx=bg.getContext("2d");
+let P=[],W,H;
+function rs(){W=bg.width=innerWidth;H=bg.height=innerHeight}
+addEventListener("resize",rs);rs();
+for(let i=0;i<60;i++)P.push({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-.5)*.3,vy:(Math.random()-.5)*.3,r:Math.random()*1.6+.4});
+function getVar(n,f){const v=getComputedStyle(document.documentElement).getPropertyValue(n).trim();return v||f}
+(function draw(){
+  bx.clearRect(0,0,W,H);
+  const col=getVar("--accent","#4aa3ff");
+  for(const p of P){
+    p.x+=p.vx;p.y+=p.vy;
+    if(p.x<0)p.x=W;if(p.x>W)p.x=0;if(p.y<0)p.y=H;if(p.y>H)p.y=0;
+    bx.beginPath();bx.arc(p.x,p.y,p.r,0,7);bx.fillStyle=col+"33";bx.fill();
+  }
+  for(let i=0;i<P.length;i++)for(let j=i+1;j<P.length;j++){
+    const a=P[i],b=P[j],dx=a.x-b.x,dy=a.y-b.y,d=dx*dx+dy*dy;
+    if(d<110*110){
+      bx.beginPath();bx.moveTo(a.x,a.y);bx.lineTo(b.x,b.y);
+      bx.strokeStyle=col+(Math.floor((1-d/(110*110))*40).toString(16).padStart(2,"0"));bx.stroke();
+    }
+  }
+  requestAnimationFrame(draw);
+})();
+
+/* ---------- CONFETTI ---------- */
+const cf=$("#confetti"),cx=cf.getContext("2d");
+let CF=[],cfRun=false;
+function rs2(){cf.width=innerWidth;cf.height=innerHeight}
+addEventListener("resize",rs2);rs2();
+function confetti(big){
+  const cols=["--accent","--cyan","--magenta","--green","--yellow"].map(n=>getVar(n,"#fff"));
+  const n=big?260:120;
+  for(let i=0;i<n;i++){
+    CF.push({x:innerWidth/2+(Math.random()-.5)*innerWidth*.5,y:innerHeight*.35,
+      vx:(Math.random()-.5)*14,vy:Math.random()*-14-4,g:.42,s:Math.random()*8+4,
+      c:cols[i%cols.length],r:Math.random()*Math.PI,vr:(Math.random()-.5)*.3,life:1});
+  }
+  if(!cfRun){cfRun=true;loop()}
+}
+function loop(){
+  cx.clearRect(0,0,cf.width,cf.height);
+  CF=CF.filter(p=>p.life>0);
+  for(const p of CF){
+    p.vy+=p.g;p.x+=p.vx;p.y+=p.vy;p.vx*=.99;p.r+=p.vr;p.life-=.006;
+    cx.save();cx.translate(p.x,p.y);cx.rotate(p.r);cx.globalAlpha=Math.max(0,p.life);
+    cx.fillStyle=p.c;cx.fillRect(-p.s/2,-p.s/2,p.s,p.s*.6);cx.restore();
+  }
+  if(CF.length){requestAnimationFrame(loop)}else{cfRun=false;cx.clearRect(0,0,cf.width,cf.height)}
+}
+</script>
+</body>
+</html>
