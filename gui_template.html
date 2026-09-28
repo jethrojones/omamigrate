@@ -182,6 +182,14 @@ body{
 .center{text-align:center}
 .mt{margin-top:16px}
 .hidden{display:none!important}
+.warn{background:color-mix(in srgb,var(--yellow) 12%,transparent);border:1px solid var(--yellow);color:var(--yellow);border-radius:10px;padding:10px 14px;font-size:13px;margin-top:12px;line-height:1.4}
+.report{display:flex;flex-direction:column;gap:10px;margin:18px 0;max-height:360px;overflow:auto;padding-right:4px}
+.rsec{border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.rsec h5{margin:0 0 8px;font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+.rsec ul{margin:0;padding-left:18px;font-size:13px;line-height:1.75}
+.rsec li code{font-family:ui-monospace,monospace;font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+.rcmd{font-family:ui-monospace,monospace;font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:1px 7px;cursor:pointer;user-select:none}
+.rcmd:hover{border-color:var(--accent);color:var(--accent)}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--muted);border-top-color:var(--fg);border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
 </style>
 </head>
@@ -230,6 +238,7 @@ body{
       </label>
     </div>
     <div class="grid" id="cat-grid"></div>
+    <div id="sensitive-warn" class="warn" hidden>🔐 This includes sensitive items (secrets &amp; personal files). Set a password in step 3 to protect the bundle before it leaves this machine.</div>
     <div class="row mt spread">
       <button class="btn ghost" onclick="go('landing')">← back</button>
       <div class="row">
@@ -310,9 +319,10 @@ body{
 
     <div class="hidden mt" id="recv-done">
       <div class="done">
-        <div class="big">🎉</div>
+        <div class="big" id="done-icon">🎉</div>
         <h2 id="done-title">All set</h2>
         <p id="done-sub"></p>
+        <div id="done-report"></div>
         <div class="row center mt" id="done-actions"></div>
       </div>
     </div>
@@ -397,9 +407,11 @@ function renderCats(){
     });
     if(c.items.length>60)itemsBox.appendChild(el("div",null,"… and "+(c.items.length-60)+" more"));
     card.onclick=e=>{
-      if($("#carbon").checked)return;
-      card.classList.toggle("sel");
-      if(card.classList.contains("sel"))lastCat.add(c.id);else lastCat.delete(c.id);
+      // Clicking a card always edits the selection, even after a carbon copy,
+      // so what is ticked is exactly what gets packed.
+      if(lastCat.has(c.id))lastCat.delete(c.id);else lastCat.add(c.id);
+      card.classList.toggle("sel",lastCat.has(c.id));
+      if($("#carbon").checked)$("#carbon").checked=false;
       updateSelSum();
       e.stopPropagation();
     };
@@ -409,17 +421,20 @@ function renderCats(){
 }
 function carbonToggle(){
   const on=$("#carbon").checked;
-  document.querySelectorAll("#cat-grid .card").forEach(c=>c.classList.toggle("sel",on));
   if(on)lastCat=new Set(INV.categories.map(c=>c.id));else lastCat.clear();
+  document.querySelectorAll("#cat-grid .card").forEach(c=>c.classList.toggle("sel",on));
   updateSelSum();
 }
 function updateSelSum(){
   let files=0,bytes=0,n=0;
   INV.categories.forEach(c=>{
-    const on=$("#carbon").checked||lastCat.has(c.id);
-    if(on){files+=c.files;bytes+=c.bytes;n++}
+    if(lastCat.has(c.id)){files+=c.files;bytes+=c.bytes;n++}
   });
   $("#sel-sum").textContent=n+" of "+INV.categories.length+" categories · "+files+" files · "+human(bytes);
+  // Surface a warning when sensitive opt-in items are in the selection.
+  const sens=INV.categories.some(c=>c.optin&&lastCat.has(c.id));
+  const w=$("#sensitive-warn");
+  if(w)w.hidden=!sens;
 }
 function setRing(pct,sub){
   $("#ring-pct").textContent=Math.round(pct*100)+"%";
@@ -427,9 +442,9 @@ function setRing(pct,sub){
   $("#ring-bar").style.strokeDashoffset=CIRC*(1-Math.min(1,Math.max(0,pct)));
 }
 async function doPack(){
-  const carbon=$("#carbon").checked;
-  const sel=carbon?[]:[...lastCat];
-  if(!carbon&&!sel.length){toast("Pick at least one category",true);return}
+  const sel=[...lastCat];
+  const carbon=sel.length===INV.categories.length;
+  if(!sel.length){toast("Pick at least one category",true);return}
   $("#pack-btn").disabled=true;
   $("#send-progress").classList.remove("hidden");
   $("#send-ready").classList.add("hidden");
@@ -514,9 +529,11 @@ function renderManifest(m){
   $("#recv-progress").classList.add("hidden");
   $("#recv-mani").classList.remove("hidden");
   const om=m.omarchy||{};
-  let cats="";
+  let cats="",totBytes=0;
   Object.entries(m.categories||{}).forEach(([id,c])=>{
-    cats+=`<span class="chip">${c.label} · <b>${c.meta&&c.meta.count!=null?c.meta.count+" pkgs":c.files+" files"}</b></span>`;
+    totBytes+=c.bytes||0;
+    const pkgs=c.meta&&c.meta.count!=null;
+    cats+=`<span class="chip">${c.label} · <b>${pkgs?c.meta.count+" pkgs":c.files+" files"}${c.bytes?" · "+human(c.bytes):""}</b></span>`;
   });
   const d=m.defaults||{};
   $("#mani-box").innerHTML=`
@@ -524,6 +541,7 @@ function renderManifest(m){
     <div class="mrow"><span class="k">omarchy</span><span>${om.version||"?"} (${om.channel||"?"})</span></div>
     <div class="mrow"><span class="k">packed</span><span>${m.created||"?"} · mode: ${m.selection&&m.selection.mode||"?"}</span></div>
     <div class="mrow"><span class="k">files</span><span>${(m.files||[]).length}</span></div>
+    <div class="mrow"><span class="k">size</span><span>${human(totBytes)}</span></div>
     <div class="mrow"><span class="k">packages</span><span>${(m.packages||[]).length}</span></div>
     <div class="mrow"><span class="k">defaults</span><span class="mono" style="font-size:12.5px">term ${d.terminal||"?"} · ed ${d.editor||"?"} · br ${d.browser||"?"}${d.agent?" · ag "+d.agent:""}</span></div>
     ${(m.themes||[]).length?`<div class="mrow" style="display:block"><span class="k">themes</span><div class="chips">${m.themes.map(t=>`<span class="chip">${t.name}</span>`).join("")}</div></div>`:""}
@@ -570,39 +588,118 @@ async function doApply(){
       }else if(ev.event==="done"){
         ok=ev.ok;
         log("#apply-console",ev.ok?"✓ apply finished":"apply finished with warnings",ev.ok?"ok":"err");
-        showDone(ev,dry);
+        showDone(ev,dry,ok);
       }
     });
   }catch(e){toast("apply failed: "+e,true)}
   $("#apply-btn").disabled=false;
 }
-async function showDone(ev,dry){
+function cmdChip(cmd){
+  const c=el("span","rcmd");c.textContent=cmd;
+  c.onclick=()=>{
+    if(navigator.clipboard)navigator.clipboard.writeText(cmd)
+      .then(()=>{c.textContent="copied ✓";setTimeout(()=>c.textContent=cmd,900)},
+            ()=>toast("copy failed",true));
+    else toast(cmd);
+  };
+  return c;
+}
+function buildReport(rep){
+  const box=el("div","report");
+  const om=rep.omarchy;
+  if(om&&!om.match){
+    const s=el("div","rsec");s.style.borderColor="var(--yellow)";
+    s.appendChild(el("h5",null,"⚠ Different Omarchy versions"));
+    const p=el("p",null,"");p.style.margin="0";p.style.fontSize="13px";
+    p.appendChild(document.createTextNode(
+      `The bundle came from Omarchy ${om.from} but this machine runs ${om.now}. `+
+      `Some settings may need re-applying. Match them with `));
+    p.appendChild(cmdChip("omarchy upgrade"));
+    s.appendChild(p);box.appendChild(s);
+  }
+  const miss=rep.packages_missing||[];
+  if(miss.length){
+    const s=el("div","rsec");
+    s.appendChild(el("h5",null,`📦 ${miss.length} package${miss.length>1?"s":""} to install`));
+    const ul=el("ul",null,"");
+    miss.forEach(p=>{
+      const li=el("li",null,"");
+      const code=el("code",null,p.name);li.appendChild(code);
+      li.appendChild(document.createTextNode(` ${p.kind==="aur"?"(AUR)":"(repo)"} · `));
+      li.appendChild(cmdChip(p.how));
+      ul.appendChild(li);
+    });
+    s.appendChild(ul);box.appendChild(s);
+  }
+  const fm=rep.files_missing_sample||[];
+  if(fm.length){
+    const s=el("div","rsec");
+    s.appendChild(el("h5",null,`🗂 ${rep.files_missing} file${rep.files_missing>1?"s":""} did not land`));
+    const ul=el("ul",null,"");
+    fm.forEach(f=>{
+      const li=el("li",null,"");
+      li.appendChild(el("code",null,f.rel));
+      li.appendChild(document.createTextNode(` — ${f.reason}`));
+      ul.appendChild(li);
+    });
+    s.appendChild(ul);box.appendChild(s);
+  }
+  const ms=rep.manual_steps||[];
+  if(ms.length){
+    const s=el("div","rsec");
+    s.appendChild(el("h5",null,"🧭 Left to finish"));
+    const ul=el("ul",null,"");
+    ms.forEach(m=>{
+      const li=el("li",null,"");
+      li.appendChild(el("b",null,m.label));
+      li.appendChild(document.createTextNode(` — ${m.why} · `));
+      li.appendChild(cmdChip(m.cmd));
+      ul.appendChild(li);
+    });
+    s.appendChild(ul);box.appendChild(s);
+  }
+  return box;
+}
+async function showDone(ev,dry,ok){
   let rep=null;
   if(!dry){
     try{rep=await api("/api/verify",{bundle:BUNDLE})}catch(e){}
   }
   $("#recv-apply").classList.add("hidden");
   $("#recv-done").classList.remove("hidden");
-  const t=$("#done-title"),s=$("#done-sub"),a=$("#done-actions");
-  a.innerHTML="";
+  const t=$("#done-title"),s=$("#done-sub"),a=$("#done-actions"),
+        r=$("#done-report"),ic=$("#done-icon");
+  a.innerHTML="";r.innerHTML="";
   if(dry){
+    ic.textContent="🔍";
     t.textContent="Dry run complete";
-    s.textContent="Nothing was changed. Untick dry run and press apply to really move everything.";
+    s.textContent="Nothing was changed. Press the button below to really move everything.";
     a.appendChild(mkBtn("← back to bundle",()=>{$("#recv-done").classList.add("hidden");$("#recv-mani").classList.remove("hidden")}));
-    a.appendChild(mkBtn("⚡ apply for real",()=>doApply(),true));
-  }else if(rep){
+    // #5: drop the dry-run flag first, otherwise doApply() reads the still
+    // checked #dry and just previews again instead of applying.
+    a.appendChild(mkBtn("⚡ apply for real",()=>{$("#dry").checked=false;doApply()},true));
+    return;
+  }
+  if(rep){
     if(rep.ok){
-      t.textContent="It's home 🎉";
+      ic.textContent="🎉";
+      t.textContent="It's home";
       s.textContent=`${rep.files_ok} files verified · ${rep.packages_total} packages all present. This machine now carries your setup.`;
+      if((rep.manual_steps||[]).length)r.appendChild(buildReport(rep));
       confetti(big=true);
       a.appendChild(mkBtn("🚀 restart shell to see it",async()=>{await api("/api/stop",{});toast("run: omarchy restart shell");}));
       a.appendChild(mkBtn("🏠 home",()=>go("landing")));
     }else{
-      t.textContent="Mostly there";
-      s.textContent=`${rep.files_ok} files ok, ${rep.files_missing} missing · ${rep.packages_missing.length} packages not found.`;
+      ic.textContent="🛠️";
+      t.textContent="Mostly there — a few gaps";
+      s.textContent=`${rep.files_ok} files ok · ${rep.files_missing} missing · ${rep.packages_missing_count||0} packages to install.`;
+      r.appendChild(buildReport(rep));
+      // #4: hand the gaps to the native agent to close.
+      a.appendChild(mkBtn("🤖 agent, fix the gaps",startAgent,true));
       a.appendChild(mkBtn("🏠 home",()=>go("landing")));
     }
   }else{
+    ic.textContent=ok?"✅":"⚠️";
     t.textContent=ok?"Applied!":"Finished";
     s.textContent=ok?"Your setup is in place.":"Apply finished — check the log for anything that needs a hand.";
     a.appendChild(mkBtn("🏠 home",()=>go("landing")));

@@ -245,6 +245,18 @@ def default_agent():
         return None
 
 
+def home_dir_rel(name):
+    """Return the on-disk name of a top-level HOME dir, matching
+    case-insensitively (so ~/projects matches 'Projects'), or None."""
+    try:
+        for e in HOME.iterdir():
+            if e.is_dir() and e.name.lower() == name.lower():
+                return e.name
+    except OSError:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # inventory
 # ---------------------------------------------------------------------------
@@ -477,15 +489,18 @@ def build_inventory():
          "desc": "SSH, GPG, keyrings — only if you tick this"}, items,
         optin=True)
 
-    # -- data --------------------------------------------------------------------
+    # -- data (case-insensitive so ~/projects matches 'Projects') ------------
     items = []
     for d in ("Documents", "Downloads", "Projects", "Work", "Music",
               "Pictures", "Videos", "Games"):
-        it = dir_item(d, d)
+        rel = home_dir_rel(d)
+        if not rel:
+            continue
+        it = dir_item(rel, d)
         if it and it["files"]:
             items.append(it)
     add({"id": "data", "label": "Personal Files", "icon": "📚",
-         "desc": "Documents, projects, media — usually not needed on a fresh box"},
+         "desc": "Documents, projects, media — tick this to bring them over"},
         items, optin=True)
 
     return {
@@ -498,10 +513,10 @@ def build_inventory():
 
 
 def carbon_items(inv):
+    """Everything on this box. A carbon copy means *everything* — including
+    the opt-in sensitive items — because the user deliberately chose it."""
     ids = []
     for cat in inv["categories"]:
-        if cat["optin"]:
-            continue
         for it in cat["items"]:
             ids.append(it["id"])
     return ids
@@ -777,30 +792,98 @@ def cmd_unpack(args):
     return 0
 
 
+def repo_package_names():
+    """Names available in the configured pacman repos, or None on error."""
+    try:
+        out = run(["pacman", "-Ssq"]).stdout
+    except Exception:
+        return None
+    return {line.split("/", 1)[0].strip() for line in out.splitlines()
+            if "/" in line}
+
+
+def remaining_steps(manifest):
+    """Things that can't be carried over automatically and need a hand."""
+    rels = [f["rel"] for f in manifest.get("files", [])]
+    # Use the *selected* categories, not every category the machine has.
+    cats = set(manifest.get("selection", {}).get("categories", []))
+    steps = []
+    if any(r.startswith(".config/tailscale") or r.startswith(".local/share/tailscale")
+           for r in rels):
+        steps.append({"label": "Reconnect your tailnet",
+                      "cmd": "sudo tailscale up",
+                      "why": "Tailscale auth state can't be copied — reconnect here."})
+    if any(r.startswith(".config/omagrid") or r.startswith(".omagrid") for r in rels):
+        steps.append({"label": "Re-authenticate omagrid",
+                      "cmd": "omagrid login",
+                      "why": "Grid credentials don't transfer — log in again."})
+    if "secrets" in cats:
+        steps.append({"label": "Unlock your keyring",
+                      "cmd": "seahorse",
+                      "why": "Copied SSH/GPG keys need the keyring unlocked to use."})
+    if any(r.endswith(".service") or r.startswith(".config/systemd") for r in rels):
+        steps.append({"label": "Enable any copied systemd units",
+                      "cmd": "systemctl --user --failed",
+                      "why": "Units are copied but not enabled on this box."})
+    steps.append({"label": "Restart your shell",
+                  "cmd": "omarchy restart shell",
+                  "why": "Pick up the restored configuration."})
+    return steps
+
+
+def _ver_unknown(v):
+    return v in (None, "", "?")
+
+
 def verify_bundle(bundle, events=False):
     m = read_manifest(bundle)
     ok = missing = 0
-    missing_rels = []
+    missing_items = []
     for f in m.get("files", []):
         p = HOME / f["rel"]
         if p.exists() and p.stat().st_size == f["bytes"]:
             ok += 1
-        else:
-            missing += 1
-            if len(missing_rels) < 50:
-                missing_rels.append(f["rel"])
-    pkgs = m.get("packages", [])
+            continue
+        reason = "size mismatch" if p.exists() else "not found"
+        missing += 1
+        if len(missing_items) < 80:
+            missing_items.append({"rel": f["rel"], "reason": reason})
+    # The manifest always carries the machine's full package list; only report
+    # on packages the bundle was actually asked to carry.
+    sel_cats = set(m.get("selection", {}).get("categories", []))
+    pkgs = m.get("packages", []) if "packages" in sel_cats else []
     installed = set()
     try:
         installed = set(run(["pacman", "-Qq"]).stdout.split())
-    except FileNotFoundError:
+    except Exception:
         pass
-    pkgs_missing = [p for p in pkgs if p not in installed]
+    avail = repo_package_names()
+    pkgs_missing = []
+    for p in pkgs:
+        if p in installed:
+            continue
+        in_repo = avail is not None and p in avail
+        pkgs_missing.append({
+            "name": p,
+            "kind": "repo" if in_repo else "aur",
+            "how": "sudo pacman -S " + p if in_repo else "yay -S " + p,
+        })
+    om_from = m.get("omarchy", {}) or {}
+    from_v = om_from.get("version") or "?"
+    from_c = om_from.get("channel") or "?"
+    now_v = omarchy_version() or "?"
+    now_c = omarchy_channel() or "?"
     report = {
         "files_ok": ok, "files_missing": missing,
-        "files_missing_sample": missing_rels,
+        "files_missing_sample": missing_items,
         "packages_total": len(pkgs),
         "packages_missing": pkgs_missing,
+        "packages_missing_count": len(pkgs_missing),
+        "omarchy": {"from": from_v, "now": now_v,
+                    "channel_from": from_c, "channel_now": now_c,
+                    "match": _ver_unknown(from_v) or _ver_unknown(now_v)
+                    or from_v == now_v},
+        "manual_steps": remaining_steps(m),
         "ok": missing == 0 and not pkgs_missing,
     }
     if events:
@@ -1297,8 +1380,19 @@ which backs up anything it overwrites.
 - `omamigrate serve` — serve the newest bundle over the LAN, prints URLs
 - `omamigrate unpack <bundle>` — inspect any bundle's manifest
 - `omamigrate apply <bundle> [--select ...] [--dry-run]` — restore on this machine
-- `omamigrate verify <bundle>` — check what a bundle restored
+- `omamigrate verify <bundle> [--json]` — check what a bundle restored
 - `omamigrate gui` — the animated dashboard (offer this any time)
+
+## Reading `verify` output
+`omamigrate verify <bundle> --json` returns a report you must interpret:
+- `files_ok` / `files_missing` (+ `files_missing_sample[]` with a `reason`) —
+  files that did not land. If any, say so and offer to re-apply.
+- `packages_missing[]` — each has a `kind` (`repo` or `aur`) and a ready `how`
+  command (e.g. `sudo pacman -S foo`, `yay -S bar`). Offer to run them.
+- `omarchy` — `from`/`now` versions and `match`. If they differ, warn that the
+  old machine ran a different Omarchy and some settings may need re-applying.
+- `manual_steps[]` — things that can't be moved automatically (tailnet, omagrid,
+  keyring, systemd units). List them and offer to run each.
 
 ## Flow
 1. Ask ONE question first: "Are we on the OLD machine (sending) or the NEW machine (receiving)?"
@@ -1318,18 +1412,34 @@ which backs up anything it overwrites.
    d. Ask what to apply (default: everything in the bundle; secrets/personal
       files are opt-in and only included if the old machine packed them).
    e. Offer `omamigrate apply <bundle> --dry-run` first if they seem unsure.
-   f. Run `omamigrate apply <bundle>`. Watch the step events, report each
-      step as it completes (backup → files → packages → plugins → themes →
-      defaults → restart → verify).
-   g. Run `omamigrate verify <bundle>` and report the result.
-4. Celebrate. One line, with personality.
+    f. Run `omamigrate apply <bundle>`. Watch the step events, report each
+       step as it completes (backup → files → packages → plugins → themes →
+       defaults → restart → verify).
+    g. Run `omamigrate verify <bundle> --json` and turn the report into a short
+       "what's done, what's left" summary (see "Reading verify output").
+ 4. Fix the gaps (always, before celebrating):
+    a. Missing packages — group the `packages_missing[]` by kind and offer to
+       install them. Show each command. For repo packages you may run the
+       `sudo pacman -S` command; for AUR ones, show the `yay`/`paru` command
+       and let the user run it (or run it if they confirm).
+    b. Version mismatch — if `omarchy.match` is false, say the new machine's
+       Omarchy differs from the old one and suggest `omarchy upgrade` if they
+       want them the same.
+    c. Manual steps — walk through `manual_steps[]` one by one, running the
+       ones that are safe and obvious (e.g. `omarchy restart shell`) and asking
+       before anything that needs credentials.
+    d. Missing files — if `files_missing` is non-zero, offer to re-run
+       `omamigrate apply <bundle>`.
+ 5. Celebrate. One line, with personality.
 
-## Style & safety
-- Warm, brief, one question at a time. Show each command before running it.
-- If a command fails, stop, show the error, and suggest a fix.
-- Never include secrets unless the user explicitly asks for them.
-- If the user just wants the pretty one, suggest `omamigrate gui`.
-"""
+ ## Style & safety
+ - Warm, brief, one question at a time. Show each command before running it.
+ - If a command fails, stop, show the error, and suggest a fix.
+ - Never include secrets unless the user explicitly asks for them.
+ - Before installing packages or changing system state, show the command and
+   get a quick yes. Batch repo installs into one pacman call where possible.
+ - If the user just wants the pretty one, suggest `omamigrate gui`.
+ """
 
 
 def cmd_agent(args):
@@ -1452,10 +1562,13 @@ def make_gui_handler(page_html):
                     sel = b.get("select")
                     cmd = [sys.executable, os.path.abspath(__file__), "pack",
                            "--events", "--out", out]
-                    if b.get("carbon"):
-                        cmd.append("--all")
-                    elif sel:
+                    # The GUI sends the explicit category list; it is the
+                    # authoritative selection. Fall back to --all (carbon =
+                    # everything) only when no list is given.
+                    if sel:
                         cmd += ["--select", ",".join(sel)]
+                    elif b.get("carbon"):
+                        cmd.append("--all")
                     proc = spawn_stream(cmd)
                     self._sse(stream_proc(proc))
                 elif path == "/api/serve":
@@ -1575,6 +1688,16 @@ def make_gui_handler(page_html):
 
 
 def build_page():
+    template = HTML
+    # Dev convenience: prefer a sibling gui_template.html so the dashboard can
+    # be edited without re-embedding. The packaged app ships no sibling, so it
+    # falls back to the embedded copy.
+    t = Path(__file__).with_name("gui_template.html")
+    if t.exists():
+        try:
+            template = t.read_text()
+        except OSError:
+            pass
     colors = theme_colors() or {}
     theme_css = f"""
 :root {{
@@ -1589,7 +1712,7 @@ def build_page():
   --cyan: {colors.get('cyan', '#56b6c2')};
   --magenta: {colors.get('magenta', '#c678dd')};
 }}"""
-    return HTML.replace("/*__THEME__*/", theme_css).replace(
+    return template.replace("/*__THEME__*/", theme_css).replace(
         "__VERSION__", VERSION).replace("__HOST__", socket.gethostname())
 
 
@@ -1626,12 +1749,15 @@ def cmd_install_menu(args):
     else:
         menu.parent.mkdir(parents=True, exist_ok=True)
         text = "{\n}\n"
-    text = re.sub(r'\n?\s*"omamigrate":\s*\{[^}]*\},?', "", text)
+    # Remove any old flat entry and the new nested one before rewriting.
+    text = re.sub(r'\n?\s*"(?:apps\.)?omamigrate":\s*\{[^}]*\},?', "", text)
     installed = os.path.join(str(HOME), ".local", "bin", "omamigrate")
     exe = os.path.abspath(
         os.environ.get("OMAMIGRATE_BIN",
                        installed if os.path.exists(installed) else __file__))
-    entry = ('  "omamigrate": {"icon":"📦","label":"Omamigrate",'
+    # Dotted id "apps.omamigrate" makes the menu nest it under the Apps menu
+    # instead of dropping it at the root level.
+    entry = ('  "apps.omamigrate": {"icon":"📦","label":"Omamigrate",'
              '"action":"' + exe + '","description":'
              '"Move your Omarchy to a new machine"},\n')
     idx = text.rfind("}")
@@ -1830,6 +1956,14 @@ body{
 .center{text-align:center}
 .mt{margin-top:16px}
 .hidden{display:none!important}
+.warn{background:color-mix(in srgb,var(--yellow) 12%,transparent);border:1px solid var(--yellow);color:var(--yellow);border-radius:10px;padding:10px 14px;font-size:13px;margin-top:12px;line-height:1.4}
+.report{display:flex;flex-direction:column;gap:10px;margin:18px 0;max-height:360px;overflow:auto;padding-right:4px}
+.rsec{border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+.rsec h5{margin:0 0 8px;font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+.rsec ul{margin:0;padding-left:18px;font-size:13px;line-height:1.75}
+.rsec li code{font-family:ui-monospace,monospace;font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+.rcmd{font-family:ui-monospace,monospace;font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:1px 7px;cursor:pointer;user-select:none}
+.rcmd:hover{border-color:var(--accent);color:var(--accent)}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid var(--muted);border-top-color:var(--fg);border-radius:50%;animation:spin .8s linear infinite;vertical-align:-2px}
 </style>
 </head>
@@ -1878,6 +2012,7 @@ body{
       </label>
     </div>
     <div class="grid" id="cat-grid"></div>
+    <div id="sensitive-warn" class="warn" hidden>🔐 This includes sensitive items (secrets &amp; personal files). Set a password in step 3 to protect the bundle before it leaves this machine.</div>
     <div class="row mt spread">
       <button class="btn ghost" onclick="go('landing')">← back</button>
       <div class="row">
@@ -1958,9 +2093,10 @@ body{
 
     <div class="hidden mt" id="recv-done">
       <div class="done">
-        <div class="big">🎉</div>
+        <div class="big" id="done-icon">🎉</div>
         <h2 id="done-title">All set</h2>
         <p id="done-sub"></p>
+        <div id="done-report"></div>
         <div class="row center mt" id="done-actions"></div>
       </div>
     </div>
@@ -2045,9 +2181,11 @@ function renderCats(){
     });
     if(c.items.length>60)itemsBox.appendChild(el("div",null,"… and "+(c.items.length-60)+" more"));
     card.onclick=e=>{
-      if($("#carbon").checked)return;
-      card.classList.toggle("sel");
-      if(card.classList.contains("sel"))lastCat.add(c.id);else lastCat.delete(c.id);
+      // Clicking a card always edits the selection, even after a carbon copy,
+      // so what is ticked is exactly what gets packed.
+      if(lastCat.has(c.id))lastCat.delete(c.id);else lastCat.add(c.id);
+      card.classList.toggle("sel",lastCat.has(c.id));
+      if($("#carbon").checked)$("#carbon").checked=false;
       updateSelSum();
       e.stopPropagation();
     };
@@ -2057,17 +2195,20 @@ function renderCats(){
 }
 function carbonToggle(){
   const on=$("#carbon").checked;
-  document.querySelectorAll("#cat-grid .card").forEach(c=>c.classList.toggle("sel",on));
   if(on)lastCat=new Set(INV.categories.map(c=>c.id));else lastCat.clear();
+  document.querySelectorAll("#cat-grid .card").forEach(c=>c.classList.toggle("sel",on));
   updateSelSum();
 }
 function updateSelSum(){
   let files=0,bytes=0,n=0;
   INV.categories.forEach(c=>{
-    const on=$("#carbon").checked||lastCat.has(c.id);
-    if(on){files+=c.files;bytes+=c.bytes;n++}
+    if(lastCat.has(c.id)){files+=c.files;bytes+=c.bytes;n++}
   });
   $("#sel-sum").textContent=n+" of "+INV.categories.length+" categories · "+files+" files · "+human(bytes);
+  // Surface a warning when sensitive opt-in items are in the selection.
+  const sens=INV.categories.some(c=>c.optin&&lastCat.has(c.id));
+  const w=$("#sensitive-warn");
+  if(w)w.hidden=!sens;
 }
 function setRing(pct,sub){
   $("#ring-pct").textContent=Math.round(pct*100)+"%";
@@ -2075,9 +2216,9 @@ function setRing(pct,sub){
   $("#ring-bar").style.strokeDashoffset=CIRC*(1-Math.min(1,Math.max(0,pct)));
 }
 async function doPack(){
-  const carbon=$("#carbon").checked;
-  const sel=carbon?[]:[...lastCat];
-  if(!carbon&&!sel.length){toast("Pick at least one category",true);return}
+  const sel=[...lastCat];
+  const carbon=sel.length===INV.categories.length;
+  if(!sel.length){toast("Pick at least one category",true);return}
   $("#pack-btn").disabled=true;
   $("#send-progress").classList.remove("hidden");
   $("#send-ready").classList.add("hidden");
@@ -2162,9 +2303,11 @@ function renderManifest(m){
   $("#recv-progress").classList.add("hidden");
   $("#recv-mani").classList.remove("hidden");
   const om=m.omarchy||{};
-  let cats="";
+  let cats="",totBytes=0;
   Object.entries(m.categories||{}).forEach(([id,c])=>{
-    cats+=`<span class="chip">${c.label} · <b>${c.meta&&c.meta.count!=null?c.meta.count+" pkgs":c.files+" files"}</b></span>`;
+    totBytes+=c.bytes||0;
+    const pkgs=c.meta&&c.meta.count!=null;
+    cats+=`<span class="chip">${c.label} · <b>${pkgs?c.meta.count+" pkgs":c.files+" files"}${c.bytes?" · "+human(c.bytes):""}</b></span>`;
   });
   const d=m.defaults||{};
   $("#mani-box").innerHTML=`
@@ -2172,6 +2315,7 @@ function renderManifest(m){
     <div class="mrow"><span class="k">omarchy</span><span>${om.version||"?"} (${om.channel||"?"})</span></div>
     <div class="mrow"><span class="k">packed</span><span>${m.created||"?"} · mode: ${m.selection&&m.selection.mode||"?"}</span></div>
     <div class="mrow"><span class="k">files</span><span>${(m.files||[]).length}</span></div>
+    <div class="mrow"><span class="k">size</span><span>${human(totBytes)}</span></div>
     <div class="mrow"><span class="k">packages</span><span>${(m.packages||[]).length}</span></div>
     <div class="mrow"><span class="k">defaults</span><span class="mono" style="font-size:12.5px">term ${d.terminal||"?"} · ed ${d.editor||"?"} · br ${d.browser||"?"}${d.agent?" · ag "+d.agent:""}</span></div>
     ${(m.themes||[]).length?`<div class="mrow" style="display:block"><span class="k">themes</span><div class="chips">${m.themes.map(t=>`<span class="chip">${t.name}</span>`).join("")}</div></div>`:""}
@@ -2218,39 +2362,118 @@ async function doApply(){
       }else if(ev.event==="done"){
         ok=ev.ok;
         log("#apply-console",ev.ok?"✓ apply finished":"apply finished with warnings",ev.ok?"ok":"err");
-        showDone(ev,dry);
+        showDone(ev,dry,ok);
       }
     });
   }catch(e){toast("apply failed: "+e,true)}
   $("#apply-btn").disabled=false;
 }
-async function showDone(ev,dry){
+function cmdChip(cmd){
+  const c=el("span","rcmd");c.textContent=cmd;
+  c.onclick=()=>{
+    if(navigator.clipboard)navigator.clipboard.writeText(cmd)
+      .then(()=>{c.textContent="copied ✓";setTimeout(()=>c.textContent=cmd,900)},
+            ()=>toast("copy failed",true));
+    else toast(cmd);
+  };
+  return c;
+}
+function buildReport(rep){
+  const box=el("div","report");
+  const om=rep.omarchy;
+  if(om&&!om.match){
+    const s=el("div","rsec");s.style.borderColor="var(--yellow)";
+    s.appendChild(el("h5",null,"⚠ Different Omarchy versions"));
+    const p=el("p",null,"");p.style.margin="0";p.style.fontSize="13px";
+    p.appendChild(document.createTextNode(
+      `The bundle came from Omarchy ${om.from} but this machine runs ${om.now}. `+
+      `Some settings may need re-applying. Match them with `));
+    p.appendChild(cmdChip("omarchy upgrade"));
+    s.appendChild(p);box.appendChild(s);
+  }
+  const miss=rep.packages_missing||[];
+  if(miss.length){
+    const s=el("div","rsec");
+    s.appendChild(el("h5",null,`📦 ${miss.length} package${miss.length>1?"s":""} to install`));
+    const ul=el("ul",null,"");
+    miss.forEach(p=>{
+      const li=el("li",null,"");
+      const code=el("code",null,p.name);li.appendChild(code);
+      li.appendChild(document.createTextNode(` ${p.kind==="aur"?"(AUR)":"(repo)"} · `));
+      li.appendChild(cmdChip(p.how));
+      ul.appendChild(li);
+    });
+    s.appendChild(ul);box.appendChild(s);
+  }
+  const fm=rep.files_missing_sample||[];
+  if(fm.length){
+    const s=el("div","rsec");
+    s.appendChild(el("h5",null,`🗂 ${rep.files_missing} file${rep.files_missing>1?"s":""} did not land`));
+    const ul=el("ul",null,"");
+    fm.forEach(f=>{
+      const li=el("li",null,"");
+      li.appendChild(el("code",null,f.rel));
+      li.appendChild(document.createTextNode(` — ${f.reason}`));
+      ul.appendChild(li);
+    });
+    s.appendChild(ul);box.appendChild(s);
+  }
+  const ms=rep.manual_steps||[];
+  if(ms.length){
+    const s=el("div","rsec");
+    s.appendChild(el("h5",null,"🧭 Left to finish"));
+    const ul=el("ul",null,"");
+    ms.forEach(m=>{
+      const li=el("li",null,"");
+      li.appendChild(el("b",null,m.label));
+      li.appendChild(document.createTextNode(` — ${m.why} · `));
+      li.appendChild(cmdChip(m.cmd));
+      ul.appendChild(li);
+    });
+    s.appendChild(ul);box.appendChild(s);
+  }
+  return box;
+}
+async function showDone(ev,dry,ok){
   let rep=null;
   if(!dry){
     try{rep=await api("/api/verify",{bundle:BUNDLE})}catch(e){}
   }
   $("#recv-apply").classList.add("hidden");
   $("#recv-done").classList.remove("hidden");
-  const t=$("#done-title"),s=$("#done-sub"),a=$("#done-actions");
-  a.innerHTML="";
+  const t=$("#done-title"),s=$("#done-sub"),a=$("#done-actions"),
+        r=$("#done-report"),ic=$("#done-icon");
+  a.innerHTML="";r.innerHTML="";
   if(dry){
+    ic.textContent="🔍";
     t.textContent="Dry run complete";
-    s.textContent="Nothing was changed. Untick dry run and press apply to really move everything.";
+    s.textContent="Nothing was changed. Press the button below to really move everything.";
     a.appendChild(mkBtn("← back to bundle",()=>{$("#recv-done").classList.add("hidden");$("#recv-mani").classList.remove("hidden")}));
-    a.appendChild(mkBtn("⚡ apply for real",()=>doApply(),true));
-  }else if(rep){
+    // #5: drop the dry-run flag first, otherwise doApply() reads the still
+    // checked #dry and just previews again instead of applying.
+    a.appendChild(mkBtn("⚡ apply for real",()=>{$("#dry").checked=false;doApply()},true));
+    return;
+  }
+  if(rep){
     if(rep.ok){
-      t.textContent="It's home 🎉";
+      ic.textContent="🎉";
+      t.textContent="It's home";
       s.textContent=`${rep.files_ok} files verified · ${rep.packages_total} packages all present. This machine now carries your setup.`;
+      if((rep.manual_steps||[]).length)r.appendChild(buildReport(rep));
       confetti(big=true);
       a.appendChild(mkBtn("🚀 restart shell to see it",async()=>{await api("/api/stop",{});toast("run: omarchy restart shell");}));
       a.appendChild(mkBtn("🏠 home",()=>go("landing")));
     }else{
-      t.textContent="Mostly there";
-      s.textContent=`${rep.files_ok} files ok, ${rep.files_missing} missing · ${rep.packages_missing.length} packages not found.`;
+      ic.textContent="🛠️";
+      t.textContent="Mostly there — a few gaps";
+      s.textContent=`${rep.files_ok} files ok · ${rep.files_missing} missing · ${rep.packages_missing_count||0} packages to install.`;
+      r.appendChild(buildReport(rep));
+      // #4: hand the gaps to the native agent to close.
+      a.appendChild(mkBtn("🤖 agent, fix the gaps",startAgent,true));
       a.appendChild(mkBtn("🏠 home",()=>go("landing")));
     }
   }else{
+    ic.textContent=ok?"✅":"⚠️";
     t.textContent=ok?"Applied!":"Finished";
     s.textContent=ok?"Your setup is in place.":"Apply finished — check the log for anything that needs a hand.";
     a.appendChild(mkBtn("🏠 home",()=>go("landing")));
