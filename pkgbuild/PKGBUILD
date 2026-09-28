@@ -1,6 +1,6 @@
 # Maintainer: Jethro Jones <https://github.com/jethrojones>
 pkgname=omamigrate
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc='Move your Omarchy setup to a new machine - one bundle, whole desktop'
 arch=('x86_64' 'aarch64')

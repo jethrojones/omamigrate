@@ -45,7 +45,7 @@ Pick whichever you like. All three put `omamigrate` on your PATH.
 omarchy pkg add omamigrate
 
 # 2. The install script (installs to ~/.local/bin, adds a menu entry, opens the dashboard)
-curl -fsSL https://raw.githubusercontent.com/jethrojones/omamigrate/v1.0.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jethrojones/omamigrate/v1.1.0/install.sh | bash
 
 # 3. Clone it
 git clone https://github.com/jethrojones/omamigrate && cd omamigrate && ./install.sh

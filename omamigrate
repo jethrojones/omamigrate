@@ -42,7 +42,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP = "omamigrate"
 
 HOME = Path(os.environ.get("HOME", "/root")).expanduser()

@@ -3,7 +3,7 @@
 # works from a checkout, or piped:  curl -fsSL <raw install.sh> | bash
 set -euo pipefail
 
-VERSION="${OMAMIGRATE_VERSION:-1.0.0}"
+VERSION="${OMAMIGRATE_VERSION:-1.1.0}"
 
 SRC="${1:-}"
 if [ -z "$SRC" ]; then
