@@ -49,6 +49,9 @@ curl -fsSL https://raw.githubusercontent.com/jethrojones/omamigrate/v1.0.0/insta
 
 # 3. Clone it
 git clone https://github.com/jethrojones/omamigrate && cd omamigrate && ./install.sh
+
+# 4. Build the Arch package (PKGBUILD ships in the repo)
+git clone https://github.com/jethrojones/omamigrate && cd omamigrate/pkgbuild && makepkg -sf && sudo pacman -U omamigrate-*.pkg.tar.zst
 ```
 
 ## A guided tour
