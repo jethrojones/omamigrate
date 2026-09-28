@@ -257,6 +257,16 @@ def home_dir_rel(name):
     return None
 
 
+def lan_copy_command(src_dir, host):
+    """rsync command to copy a dir to a host over the LAN/tailnet, to the same
+    absolute path. A separate manual step — local AI models are often too big
+    to put inside a bundle."""
+    src = str(src_dir)
+    if " " in src:
+        src = f'"{src}"'
+    return f"rsync -av --progress {src} {host}:{src}"
+
+
 # ---------------------------------------------------------------------------
 # inventory
 # ---------------------------------------------------------------------------
@@ -503,6 +513,21 @@ def build_inventory():
          "desc": "Documents, projects, media — tick this to bring them over"},
         items, optin=True)
 
+    # -- local AI models (opt-in: many GB, so never packed silently) ---------
+    items = []
+    for rel, label in ((".lmstudio", "LM Studio"), (".ollama", "ollama")):
+        it = dir_item(rel, label)
+        if it:
+            items.append(it)
+    if items:
+        add({"id": "aimodels", "label": "Local AI Models", "icon": "🧠",
+             "desc": "LM Studio and ollama models — huge; tick this, "
+                     "or LAN-copy instead"},
+            items, optin=True,
+            meta={"lan": [{"path": str(HOME / it["rel"]),
+                           "bytes": it["bytes"], "files": it["files"]}
+                          for it in items]})
+
     return {
         "host": socket.gethostname(),
         "user": os.environ.get("USER", "user"),
@@ -548,7 +573,7 @@ def resolve_selection(inv, select=None, exclude=None):
 # ---------------------------------------------------------------------------
 
 def pack_bundle(inv, selection, out, events, mode="selective",
-                include_packages=False):
+                include_packages=False, extra_paths=None):
     emit(events, {"event": "start", "phase": "gather"})
     files = []
     seen = set()
@@ -566,6 +591,34 @@ def pack_bundle(inv, selection, out, events, mode="selective",
                     if rel not in seen:
                         seen.add(rel)
                         files.append((rel, str(HOME / rel)))
+    # extra paths: arbitrary absolute files/dirs, stored root-relative so the
+    # receiver restores them to their original location
+    extra_paths = extra_paths or []
+    extra_file_rels = set()
+    extras_manifest = []
+    for raw in extra_paths:
+        src = Path(os.path.normpath(str(Path(str(raw)).expanduser())))
+        if not src.is_absolute():
+            emit(events, {"event": "log",
+                          "line": f"skip extra {raw}: not an absolute path"})
+            continue
+        if str(src) == "/":
+            emit(events, {"event": "log",
+                          "line": "skip extra /: refusing to pack the filesystem"})
+            continue
+        if not src.exists():
+            emit(events, {"event": "log",
+                          "line": f"skip extra {src}: not found"})
+            continue
+        rel = str(src).lstrip("/")
+        walked = walk_files(src, rel)
+        for frel, _size in walked:
+            if frel not in seen:
+                seen.add(frel)
+                files.append((frel, str(Path("/") / frel)))
+                extra_file_rels.add(frel)
+        extras_manifest.append({"path": str(src), "rel": rel,
+                                "bytes": sum(s for _, s in walked)})
     files.sort()
     total = len(files)
     emit(events, {"event": "count", "total": total,
@@ -625,7 +678,8 @@ def pack_bundle(inv, selection, out, events, mode="selective",
             size = os.path.getsize(s)
         except OSError:
             size = 0
-        files_manifest.append({"rel": r, "bytes": size, "cat": cat_for(r)})
+        cat = "extras" if r in extra_file_rels else cat_for(r)
+        files_manifest.append({"rel": r, "bytes": size, "cat": cat})
 
     theme_name = current_theme()
     theme_selected = any(
@@ -646,6 +700,8 @@ def pack_bundle(inv, selection, out, events, mode="selective",
                          "background": bg_rel}
 
     cat_counts = {}
+    if extras_manifest:
+        cat_counts["extras"] = {"label": "Extra Paths", "files": 0, "bytes": 0}
     for f in files_manifest:
         c = cat_counts.setdefault(f["cat"], {"label": "Misc", "files": 0,
                                              "bytes": 0})
@@ -668,6 +724,7 @@ def pack_bundle(inv, selection, out, events, mode="selective",
         "selection": {"mode": mode, "categories": [], "items": selection},
         "categories": cat_counts,
         "files": files_manifest,
+        "extra_paths": extras_manifest,
         "plugins": plugins,
         "themes": themes,
         "packages": sorted({m for c in inv["categories"]
@@ -727,12 +784,13 @@ def cmd_pack(args):
                    for c in inv["categories"])
     want_pkgs = args.all or (args.select and
                              "packages" in args.select.split(","))
-    if not select and not want_pkgs and not has_pkgs:
+    if not select and not want_pkgs and not has_pkgs and not args.extra:
         print("Nothing selected. Use --all or --select cat1,cat2 "
               "(see: omamigrate scan)", file=sys.stderr)
         return 1
     pack_bundle(inv, select, out, args.events, mode=mode,
-                include_packages=want_pkgs or args.all)
+                include_packages=want_pkgs or args.all,
+                extra_paths=args.extra)
     if not args.events:
         print(f"Bundle ready: {out}")
     return 0
@@ -784,6 +842,7 @@ def cmd_unpack(args):
         "omarchy": m.get("omarchy"), "selection": m.get("selection"),
         "categories": m.get("categories"),
         "files": len(m.get("files", [])),
+        "extra_paths": m.get("extra_paths", []),
         "packages": len(m.get("packages", [])),
         "plugins": [p["id"] for p in m.get("plugins", [])],
         "themes": [t["name"] for t in m.get("themes", [])],
@@ -839,8 +898,10 @@ def verify_bundle(bundle, events=False):
     m = read_manifest(bundle)
     ok = missing = 0
     missing_items = []
+    extra_rels = {f["rel"] for f in m.get("files", [])
+                  if f.get("cat") == "extras"}
     for f in m.get("files", []):
-        p = HOME / f["rel"]
+        p = Path("/") / f["rel"] if f["rel"] in extra_rels else HOME / f["rel"]
         if p.exists() and p.stat().st_size == f["bytes"]:
             ok += 1
             continue
@@ -873,9 +934,13 @@ def verify_bundle(bundle, events=False):
     from_c = om_from.get("channel") or "?"
     now_v = omarchy_version() or "?"
     now_c = omarchy_channel() or "?"
+    extra_status = [{"path": e["path"], "bytes": e["bytes"],
+                     "present": Path(e["path"]).exists()}
+                    for e in m.get("extra_paths", [])]
     report = {
         "files_ok": ok, "files_missing": missing,
         "files_missing_sample": missing_items,
+        "extra_paths": extra_status,
         "packages_total": len(pkgs),
         "packages_missing": pkgs_missing,
         "packages_missing_count": len(pkgs_missing),
@@ -948,6 +1013,18 @@ def cmd_apply(args):
         sel_cats = set(manifest.get("selection", {}).get("categories", []))
     sel_rels = [r for r in sel_rels if r not in exclude]
     selset = set(sel_rels)
+    # extras were explicitly requested at pack time; always restore them to
+    # their original (absolute) location
+    extra_rels = {f["rel"] for f in manifest.get("files", [])
+                  if f.get("cat") == "extras"}
+    for f in manifest.get("files", []):
+        if f.get("cat") == "extras" and f["rel"] not in exclude \
+                and f["rel"] not in selset:
+            sel_rels.append(f["rel"])
+            selset.add(f["rel"])
+
+    def dest_for(rel):
+        return Path("/") / rel if rel in extra_rels else HOME / rel
 
     stats = {"files": 0, "backed_up": 0, "packages": 0,
              "plugins": 0, "themes": 0, "skipped": []}
@@ -958,7 +1035,7 @@ def cmd_apply(args):
             return "dry run"
         n = 0
         for rel in sel_rels:
-            p = HOME / rel
+            p = dest_for(rel)
             if p.is_file() and p.exists():
                 dest = backup_dir / rel
                 dest.parent.mkdir(parents=True, exist_ok=True)
@@ -979,7 +1056,7 @@ def cmd_apply(args):
         step_size = max(1, len(sel_rels) // 300)
         for i, rel in enumerate(sel_rels, 1):
             src = root / "files" / rel
-            dest = HOME / rel
+            dest = dest_for(rel)
             if not src.exists():
                 continue
             if dry:
@@ -1201,7 +1278,7 @@ def cmd_apply(args):
             return "dry run"
         ok = missing = 0
         for f in manifest.get("files", []):
-            p = HOME / f["rel"]
+            p = dest_for(f["rel"])
             if p.exists() and p.stat().st_size == f["bytes"]:
                 ok += 1
             else:
@@ -1377,6 +1454,8 @@ which backs up anything it overwrites.
 - `omamigrate scan` — inventory this machine (categories with sizes)
 - `omamigrate pack --all --out <path>` — carbon-copy bundle of everything
 - `omamigrate pack --select shell,themes,hyprland --out <path>` — selective
+- `omamigrate pack ... --extra /abs/path` — repeatable; adds arbitrary extra
+  files/dirs to the bundle (restored to the same path on the new machine)
 - `omamigrate serve` — serve the newest bundle over the LAN, prints URLs
 - `omamigrate unpack <bundle>` — inspect any bundle's manifest
 - `omamigrate apply <bundle> [--select ...] [--dry-run]` — restore on this machine
@@ -1391,8 +1470,11 @@ and say what will need a hand. Check quietly, then summarize in one short list:
   need to run `sudo tailscale up` here" (new). Auth never copies.
 - omagrid: `command -v omagrid` / `omagrid status` — re-login needed.
 - Local AI models (big!): LM Studio `~/.lmstudio/models`, ollama `~/.ollama`.
-  These are often gigabytes. Offer to copy them over the LAN as a separate
-  step, not inside the bundle (see the bundle's extra-paths if present).
+  These are often gigabytes. They show up in `scan` as the opt-in `aimodels`
+  category (with sizes in its `meta.lan`). Offer to copy them over the LAN as
+  a separate step, not inside the bundle (an rsync like
+  `rsync -av --progress ~/.lmstudio new-host:~/.lmstudio`; see the bundle's
+  extra-paths if present).
 - Anything else the user names (network shares, game saves, etc.).
 Say "Here's what won't come over by itself: …" so the user isn't surprised
 later. Give a hint if you can (e.g. "Tailscale — reconnect on the new box").
@@ -2581,6 +2663,8 @@ def main(argv=None):
     p.add_argument("--out", default=None)
     p.add_argument("--all", action="store_true", help="carbon copy (everything)")
     p.add_argument("--select", default=None, help="comma-separated category ids")
+    p.add_argument("--extra", action="append", default=None,
+                   help="extra absolute file/dir to include (repeatable)")
     p.add_argument("--events", action="store_true")
 
     p = sub.add_parser("serve", help="serve the newest bundle over the LAN")
