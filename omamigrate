@@ -1383,6 +1383,20 @@ which backs up anything it overwrites.
 - `omamigrate verify <bundle> [--json]` — check what a bundle restored
 - `omamigrate gui` — the animated dashboard (offer this any time)
 
+## Find the extras early (don't wait to be asked)
+Don't do a slow one-thing-at-a-time walk. On the FIRST turn, after you know
+which machine you're on, proactively check for the things a bundle can't carry
+and say what will need a hand. Check quietly, then summarize in one short list:
+- Tailscale: `command -v tailscale` and `tailscale status` (old), or "you'll
+  need to run `sudo tailscale up` here" (new). Auth never copies.
+- omagrid: `command -v omagrid` / `omagrid status` — re-login needed.
+- Local AI models (big!): LM Studio `~/.lmstudio/models`, ollama `~/.ollama`.
+  These are often gigabytes. Offer to copy them over the LAN as a separate
+  step, not inside the bundle (see the bundle's extra-paths if present).
+- Anything else the user names (network shares, game saves, etc.).
+Say "Here's what won't come over by itself: …" so the user isn't surprised
+later. Give a hint if you can (e.g. "Tailscale — reconnect on the new box").
+
 ## Reading `verify` output
 `omamigrate verify <bundle> --json` returns a report you must interpret:
 - `files_ok` / `files_missing` (+ `files_missing_sample[]` with a `reason`) —
